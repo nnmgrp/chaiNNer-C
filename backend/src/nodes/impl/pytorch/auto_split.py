@@ -239,4 +239,6 @@ def pytorch_auto_split(
         return result
 
     with _stoppable(model.model):
-        return auto_split(img, upscale, BoundedTiler(tiler), overlap=overlap, progress=progress)
+        return auto_split(
+            img, upscale, BoundedTiler(tiler), overlap=overlap, progress=progress
+        )
