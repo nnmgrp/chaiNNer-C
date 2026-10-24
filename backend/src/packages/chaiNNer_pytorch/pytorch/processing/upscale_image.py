@@ -38,6 +38,20 @@ from .. import processing_group
 MODEL_BYTES_CACHE = weakref.WeakKeyDictionary()
 
 
+def get_architecture_tiling_hints(model: ImageModelDescriptor) -> tuple[int, int]:
+    """
+    Returns (grid_step, recommended_overlap) based on model architecture.
+    """
+    arch_id = getattr(getattr(model, "architecture", None), "id", "")
+    if arch_id == "SwinUNet":
+        # Waifu2x SwinUNet: 6x6 attention window with 48px grid alignment (16 + 48k)
+        return 48, 48
+    elif arch_id in ("HAT", "DAT", "SwinIR", "Swin2SR", "DRCT", "SST", "SSTReal"):
+        # Attention models with 8x8 or 16x16 window: require >= 48px overlap to avoid seam artifacts
+        return 64, 48
+    return 16, 16
+
+
 def upscale(
     img: np.ndarray,
     model: ImageModelDescriptor,
@@ -52,6 +66,14 @@ def upscale(
         # TODO: use bfloat16 if RTX
         use_fp16 = options.use_fp16 and model.supports_half
         device = options.device
+
+        grid_step, recommended_overlap = get_architecture_tiling_hints(model)
+
+        def align_tile(tile: int) -> int:
+            if tile <= 0:
+                return tile
+            aligned = (tile // grid_step) * grid_step
+            return max(aligned, grid_step)
 
         if model.tiling == ModelTiling.INTERNAL:
             # disable tiling if the model already does it internally
@@ -75,27 +97,25 @@ def upscale(
                 # Estimate using 80% of the value to be more conservative
                 budget = int(total * 0.8)
 
-                return MaxTileSize(
-                    estimate_tile_size(
-                        budget,
-                        model_bytes,
-                        img,
-                        2 if use_fp16 else 4,
-                    )
+                raw_est = estimate_tile_size(
+                    budget,
+                    model_bytes,
+                    img,
+                    2 if use_fp16 else 4,
                 )
+                return MaxTileSize(align_tile(raw_est))
             elif device.type == "cpu":
                 free = psutil.virtual_memory().available
                 if options.budget_limit > 0:
                     free = min(options.budget_limit * 1024**3, free)
                 budget = int(free * 0.8)
-                return MaxTileSize(
-                    estimate_tile_size(
-                        budget,
-                        model_bytes,
-                        img,
-                        4,
-                    )
+                raw_est = estimate_tile_size(
+                    budget,
+                    model_bytes,
+                    img,
+                    4,
                 )
+                return MaxTileSize(align_tile(raw_est))
             return MaxTileSize()
 
         img_out = pytorch_auto_split(
@@ -105,6 +125,7 @@ def upscale(
             use_fp16=use_fp16,
             tiler=parse_tile_size_input(tile_size, estimate),
             progress=progress,
+            overlap=recommended_overlap,
         )
         logger.debug("Done upscaling")
 

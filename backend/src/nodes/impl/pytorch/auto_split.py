@@ -157,6 +157,7 @@ def pytorch_auto_split(
     use_fp16: bool,
     tiler: Tiler,
     progress: Progress,
+    overlap: int = 16,
 ) -> np.ndarray:
     dtype = torch.float16 if use_fp16 else torch.float32
     if model.dtype != dtype or model.device != device:
@@ -238,4 +239,4 @@ def pytorch_auto_split(
         return result
 
     with _stoppable(model.model):
-        return auto_split(img, upscale, BoundedTiler(tiler))
+        return auto_split(img, upscale, BoundedTiler(tiler), overlap=overlap, progress=progress)
