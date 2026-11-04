@@ -33,7 +33,7 @@ from .. import utility_group
 
 
 def locate_dft_plugin() -> Path:
-    """Locate the TensorRT DFT plugin DLL."""
+    """Locate the TensorRT DFT plugin DLL, or raise an informative error."""
     cand1 = dual.SOURCE / "nodes" / "impl" / "tensorrt" / "trt_dft_plugins.dll"
     if cand1.is_file():
         return cand1
@@ -41,7 +41,11 @@ def locate_dft_plugin() -> Path:
     cand2 = site_packages / "tensorrt_libs" / "trt_dft_plugins.dll"
     if cand2.is_file():
         return cand2
-    return cand1
+    raise RuntimeError(
+        f"TensorRT DFT plugin library (trt_dft_plugins.dll) was not found at {cand1}. "
+        "To build FFT models in TensorRT, please ensure trt_dft_plugins.dll is present, "
+        "or use the standard PyTorch nodes (Load Model -> Upscale Image) for pure Python execution."
+    )
 
 
 if utility_group is not None:
