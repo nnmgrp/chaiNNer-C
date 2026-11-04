@@ -34,12 +34,36 @@ def load_checkpoint(model_path: str | Path) -> dict[str, torch.Tensor]:
 
 def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], int]:
     """
-    Loads an FFT model either via spandrel or direct architecture instantiation.
+    Loads an FFT model either via direct architecture instantiation (preferred for
+    native TensorRT DFT plugins) or via spandrel fallback.
     Returns (model, metadata, scale).
     """
     model_path = Path(model_path)
+    state_dict = load_checkpoint(model_path)
+    keys_str = " ".join(state_dict.keys())
 
-    # 1. Try loading via spandrel
+    # 1. Direct custom architectures for GFISRV2 and LAWFFT (native ai.onnx.contrib plugins)
+    if "gfisr_body" in keys_str or "rn.scale" in keys_str or "post_norm.scale" in keys_str:
+        params = detect_gfisrv2_params(state_dict)
+        params["normalized"] = 1
+        model = GFISRV2(**params)
+        model.load_state_dict(state_dict, strict=False)
+        scale = params.get("upscale", 1)
+        meta = {"arch": "GFISRV2", "params": params, "scale": scale, "normalized": 1}
+        model.eval()
+        return model, meta, scale
+
+    if "FSAS" in keys_str or "body.0.residual" in keys_str or "t_mid_factor" in keys_str:
+        params = detect_lawfft_params(state_dict)
+        params["normalized"] = 0
+        model = LAWFFT(**params)
+        model.load_state_dict(state_dict, strict=False)
+        scale = params.get("upscale", 1)
+        meta = {"arch": "LAWFFT", "params": params, "scale": scale, "normalized": 0}
+        model.eval()
+        return model, meta, scale
+
+    # 2. Fallback to spandrel
     try:
         from spandrel import ModelLoader
         descriptor = ModelLoader().load_from_file(str(model_path))
@@ -52,29 +76,7 @@ def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], i
     except Exception:
         pass
 
-    # 2. Direct fallback for GFISRV2 and LAWFFT
-    state_dict = load_checkpoint(model_path)
-    keys_str = " ".join(state_dict.keys())
-
-    if "gfisr_body" in keys_str or "rn.scale" in keys_str or "post_norm.scale" in keys_str:
-        params = detect_gfisrv2_params(state_dict)
-        params["normalized"] = 1
-        model = GFISRV2(**params)
-        model.load_state_dict(state_dict, strict=False)
-        scale = params.get("upscale", 1)
-        meta = {"arch": "GFISRV2", "params": params, "scale": scale, "normalized": 1}
-    elif "FSAS" in keys_str or "body.0.residual" in keys_str or "t_mid_factor" in keys_str:
-        params = detect_lawfft_params(state_dict)
-        params["normalized"] = 0
-        model = LAWFFT(**params)
-        model.load_state_dict(state_dict, strict=False)
-        scale = params.get("upscale", 1)
-        meta = {"arch": "LAWFFT", "params": params, "scale": scale, "normalized": 0}
-    else:
-        raise ValueError(f"Could not identify FFT model architecture from weights: {model_path.name}")
-
-    model.eval()
-    return model, meta, scale
+    raise ValueError(f"Could not identify FFT model architecture from weights: {model_path.name}")
 
 
 def register_fft_symbolics(opset: int = 17, normalized: int = 1) -> None:

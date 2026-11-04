@@ -61,8 +61,8 @@ if utility_group is not None:
             NumberInput("Tile Size", default=256, min=64, max=1024, step=64, unit="px").with_docs(
                 "Spatial tile size for inference. Larger tiles (256, 512) significantly reduce tiling overhead."
             ),
-            BoolInput("Dynamic Shapes", default=True).with_docs(
-                "When enabled, the engine allows variable tile sizes from 64px up to 2x Tile Size."
+            BoolInput("Dynamic Shapes", default=False).with_docs(
+                "When disabled (recommended for FFT), builds an engine optimized for the exact tile size with fixed cuFFT plans."
             ),
             BoolInput("FP16", default=True).with_docs(
                 "Enable FP16 precision for faster inference and lower VRAM usage."
@@ -138,6 +138,9 @@ if utility_group is not None:
                     context,
                 )
                 logger.info("[FFT] TensorRT compilation finished.")
+
+                from nodes.impl.tensorrt.drft import load_plugins
+                load_plugins()
 
                 engine_bytes = read_file(temp_engine)
                 loaded = deserialize_engine(engine_bytes, gpu_index)
