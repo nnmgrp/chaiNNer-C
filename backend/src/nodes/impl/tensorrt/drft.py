@@ -58,33 +58,11 @@ def load_plugins() -> None:
     registry, once, before any engine is deserialized (engine_info.deserialize_engine,
     runner.load_tensorrt). A build without the library registers nothing; DRFT engines
     then fail to deserialize, other engines are unaffected."""
-    import os
-    import sys
     from pathlib import Path
 
-    site_packages = Path(sys.executable).parent / "Lib" / "site-packages"
-    trt_libs = site_packages / "tensorrt_libs"
-    if trt_libs.is_dir() and hasattr(os, "add_dll_directory"):
-        try:
-            os.add_dll_directory(str(trt_libs))
-            os.environ["PATH"] = str(trt_libs) + ";" + os.environ.get("PATH", "")
-        except Exception:
-            pass
+    from .cuda_dll import setup_cuda_dll_directories
 
-    for cuda_cand in (
-        r"G:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\x64",
-        r"G:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin",
-        r"G:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\x64",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
-    ):
-        if os.path.isdir(cuda_cand) and hasattr(os, "add_dll_directory"):
-            try:
-                os.add_dll_directory(cuda_cand)
-                os.environ["PATH"] = cuda_cand + ";" + os.environ.get("PATH", "")
-            except Exception:
-                pass
+    setup_cuda_dll_directories()
 
     import tensorrt
 

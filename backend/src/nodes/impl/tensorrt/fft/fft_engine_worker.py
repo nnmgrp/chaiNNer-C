@@ -17,27 +17,10 @@ def main(
     dynamic: str,
     tile_size: str,
 ) -> None:
-    # 1. Setup CUDA DLL directories on Windows
-    site_packages = Path(sys.executable).parent / "Lib" / "site-packages"
-    trt_libs = site_packages / "tensorrt_libs"
-    if trt_libs.is_dir() and hasattr(os, "add_dll_directory"):
-        os.add_dll_directory(str(trt_libs))
-        os.environ["PATH"] = str(trt_libs) + ";" + os.environ.get("PATH", "")
+    # 1. Setup CUDA DLL directories on Windows dynamically
+    from nodes.impl.tensorrt.cuda_dll import setup_cuda_dll_directories
 
-    for cuda_cand in (
-        r"G:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\x64",
-        r"G:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin",
-        r"G:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\x64",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
-    ):
-        if os.path.isdir(cuda_cand) and hasattr(os, "add_dll_directory"):
-            try:
-                os.add_dll_directory(cuda_cand)
-                os.environ["PATH"] = cuda_cand + ";" + os.environ.get("PATH", "")
-            except Exception:
-                pass
+    setup_cuda_dll_directories()
 
     import tensorrt as trt
     from cuda.bindings import runtime as cudart

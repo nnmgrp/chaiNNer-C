@@ -76,7 +76,6 @@ if utility_group is not None:
             DirectoryOutput("Directory", of_input=0).with_id(2),
             FileNameOutput("Name", of_input=0).with_id(1),
         ],
-        side_effects=True,
         node_context=True,
     )
     def build_fft_engine_node(
