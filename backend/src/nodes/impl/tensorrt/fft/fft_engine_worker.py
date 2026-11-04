@@ -17,10 +17,10 @@ def main(
     dynamic: str,
     tile_size: str,
 ) -> None:
-    # 1. Setup CUDA DLL directories on Windows dynamically
-    from nodes.impl.tensorrt.cuda_dll import setup_cuda_dll_directories
+    # 1. Register CUDA DLL directories on Windows dynamically
+    from nodes.impl.tensorrt.cuda_dll import register_cuda_dll_directories
 
-    setup_cuda_dll_directories()
+    register_cuda_dll_directories()
 
     import tensorrt as trt
     from cuda.bindings import runtime as cudart

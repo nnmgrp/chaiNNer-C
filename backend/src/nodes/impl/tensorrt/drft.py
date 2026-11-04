@@ -60,9 +60,9 @@ def load_plugins() -> None:
     then fail to deserialize, other engines are unaffected."""
     from pathlib import Path
 
-    from .cuda_dll import setup_cuda_dll_directories
+    from .cuda_dll import register_cuda_dll_directories
 
-    setup_cuda_dll_directories()
+    register_cuda_dll_directories()
 
     import tensorrt
 

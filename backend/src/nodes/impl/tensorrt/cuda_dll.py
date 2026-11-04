@@ -54,8 +54,9 @@ def discover_cuda_dll_directories() -> list[str]:
 
 
 @lru_cache(maxsize=1)
-def setup_cuda_dll_directories() -> list[str]:
-    """Register discovered CUDA and TensorRT DLL directories via os.add_dll_directory and prepend to PATH."""
+def register_cuda_dll_directories() -> list[str]:
+    """Register discovered CUDA and TensorRT DLL directories in current process via os.add_dll_directory and prepend to PATH.
+    Does NOT install anything — only informs Windows where to look for existing CUDA/TensorRT DLLs."""
     if os.name != "nt":
         return []
 
@@ -76,3 +77,7 @@ def setup_cuda_dll_directories() -> list[str]:
         os.environ["PATH"] = ";".join(path_prepend) + ";" + os.environ.get("PATH", "")
 
     return registered
+
+
+# Alias for backward compatibility
+setup_cuda_dll_directories = register_cuda_dll_directories
