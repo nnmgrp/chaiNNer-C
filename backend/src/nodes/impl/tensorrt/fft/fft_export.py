@@ -48,7 +48,7 @@ def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], i
         params["normalized"] = 1
         model = GFISRV2(**params)
         model.load_state_dict(state_dict, strict=False)
-        scale = params.get("upscale", 1)
+        scale = params.get("scale", params.get("upscale", 1))
         meta = {"arch": "GFISRV2", "params": params, "scale": scale, "normalized": 1}
         model.eval()
         return model, meta, scale
@@ -58,7 +58,7 @@ def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], i
         params["normalized"] = 0
         model = LAWFFT(**params)
         model.load_state_dict(state_dict, strict=False)
-        scale = params.get("upscale", 1)
+        scale = params.get("scale", params.get("upscale", 1))
         meta = {"arch": "LAWFFT", "params": params, "scale": scale, "normalized": 0}
         model.eval()
         return model, meta, scale
@@ -81,8 +81,7 @@ def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], i
 
 def register_fft_symbolics(opset: int = 17, normalized: int = 1) -> None:
     """Registers custom FFT symbolics for ONNX export."""
-    @parse_args("v")
-    def symbolic_rfft2(g: Any, x: Any) -> Any:
+    def symbolic_rfft2(g: Any, x: Any, *args: Any, **kwargs: Any) -> Any:
         return g.op(
             "ai.onnx.contrib::Rfft",
             x,
@@ -91,8 +90,7 @@ def register_fft_symbolics(opset: int = 17, normalized: int = 1) -> None:
             signal_ndim_i=2,
         )
 
-    @parse_args("v")
-    def symbolic_irfft2(g: Any, x: Any) -> Any:
+    def symbolic_irfft2(g: Any, x: Any, *args: Any, **kwargs: Any) -> Any:
         return g.op(
             "ai.onnx.contrib::Irfft",
             x,
@@ -101,8 +99,11 @@ def register_fft_symbolics(opset: int = 17, normalized: int = 1) -> None:
             signal_ndim_i=2,
         )
 
-    register_custom_op_symbolic("aten::fft_rfft2", symbolic_rfft2, opset)
-    register_custom_op_symbolic("aten::fft_irfft2", symbolic_irfft2, opset)
+    try:
+        register_custom_op_symbolic("aten::fft_rfft2", symbolic_rfft2, opset)
+        register_custom_op_symbolic("aten::fft_irfft2", symbolic_irfft2, opset)
+    except Exception:
+        pass
 
 
 def export_fft_onnx(
