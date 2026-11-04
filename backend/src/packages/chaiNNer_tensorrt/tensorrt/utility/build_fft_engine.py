@@ -61,7 +61,7 @@ if utility_group is not None:
         ],
         icon="BsNvidia",
         inputs=[
-            PthFileInput("PyTorch Model File", primary_input=False),
+            PthFileInput(primary_input=False),
             NumberInput("Tile Size", default=256, min=64, max=1024, step=64, unit="px").with_docs(
                 "Spatial tile size for inference. Larger tiles (256, 512) significantly reduce tiling overhead."
             ),
