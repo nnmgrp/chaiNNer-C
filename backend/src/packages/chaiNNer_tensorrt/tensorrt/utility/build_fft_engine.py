@@ -79,7 +79,7 @@ if utility_group is not None:
             ),
         ],
         outputs=[
-            TensorRTEngineOutput("Engine").suggest(),
+            TensorRTEngineOutput(kind="tagged").suggest(),
             DirectoryOutput("Directory", of_input=0).with_id(2),
             FileNameOutput("Name", of_input=0).with_id(1),
         ],
