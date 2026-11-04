@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import tempfile
 import hashlib
 from pathlib import Path
@@ -60,7 +61,7 @@ if utility_group is not None:
         ],
         icon="BsNvidia",
         inputs=[
-            PthFileInput(primary_input=True),
+            PthFileInput("PyTorch Model File", primary_input=False),
             NumberInput("Tile Size", default=256, min=64, max=1024, step=64, unit="px").with_docs(
                 "Spatial tile size for inference. Larger tiles (256, 512) significantly reduce tiling overhead."
             ),
@@ -100,33 +101,18 @@ if utility_group is not None:
 
         def build() -> TensorRTEngine:
             logger.info("Starting Build FFT Engine for: %s", model_path.name)
-            from nodes.impl.tensorrt.fft.fft_export import load_fft_model, export_fft_onnx
 
             with tempfile.TemporaryDirectory(prefix="chainner-fft-") as temp_dir:
-                temp_onnx = Path(temp_dir) / "model.onnx"
                 temp_engine = Path(temp_dir) / "model.engine"
+                meta_json = Path(temp_dir) / "meta.json"
 
-                # 1. Load model and export to ONNX
-                logger.info("[FFT] Loading model and exporting to ONNX...")
-                model, meta, scale = load_fft_model(model_path)
-                norm_val = int(meta.get("normalized", 0))
-                export_fft_onnx(
-                    model=model,
-                    output_path=temp_onnx,
-                    tile_size=tile_size,
-                    dynamic=dynamic_shapes,
-                    opset=17,
-                    normalized=norm_val,
-                )
-                logger.info("[FFT] ONNX export completed successfully.")
-
-                # 2. Build TensorRT Engine via worker child process
-                logger.info("[FFT] Compiling TensorRT engine (autotuning kernels)...")
+                # Build TensorRT Engine via worker child process
+                logger.info("[FFT] Exporting model and compiling TensorRT engine in worker child process...")
                 dual.run_child(
                     [
                         "-m",
                         "nodes.impl.tensorrt.fft.fft_engine_worker",
-                        str(temp_onnx),
+                        str(model_path),
                         str(temp_engine),
                         str(gpu_index),
                         str(plugin_dll),
@@ -134,12 +120,20 @@ if utility_group is not None:
                         "1" if fp16 else "0",
                         "1" if dynamic_shapes else "0",
                         str(tile_size),
+                        str(meta_json),
                     ],
                     "FFT Engine Build",
                     dual.SOURCE,
                     context,
                 )
                 logger.info("[FFT] TensorRT compilation finished.")
+
+                scale = 1
+                if meta_json.is_file():
+                    try:
+                        scale = int(json.loads(meta_json.read_text(encoding="utf-8")).get("scale", 1))
+                    except Exception:
+                        pass
 
                 engine_bytes = read_file(temp_engine)
                 major, minor = get_cuda_compute_capability(gpu_index)

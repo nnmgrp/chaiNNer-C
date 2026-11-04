@@ -32,7 +32,10 @@ def load_checkpoint(model_path: str | Path) -> dict[str, torch.Tensor]:
     raise ValueError(f"Unrecognized checkpoint format: {path_str}")
 
 
-def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], int]:
+def load_fft_model(
+    model_path: str | Path,
+    device: str | torch.device | None = None,
+) -> tuple[nn.Module, dict[str, Any], int]:
     """
     Loads an FFT model either via direct architecture instantiation (preferred for
     native TensorRT DFT plugins) or via spandrel fallback.
@@ -51,6 +54,8 @@ def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], i
         scale = params.get("scale", params.get("upscale", 1))
         meta = {"arch": "GFISRV2", "params": params, "scale": scale, "normalized": 1}
         model.eval()
+        if device is not None:
+            model = model.to(device)
         return model, meta, scale
 
     if "FSAS" in keys_str or "body.0.residual" in keys_str or "t_mid_factor" in keys_str:
@@ -61,6 +66,8 @@ def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], i
         scale = params.get("scale", params.get("upscale", 1))
         meta = {"arch": "LAWFFT", "params": params, "scale": scale, "normalized": 0}
         model.eval()
+        if device is not None:
+            model = model.to(device)
         return model, meta, scale
 
     # 2. Fallback to spandrel
@@ -72,6 +79,8 @@ def load_fft_model(model_path: str | Path) -> tuple[nn.Module, dict[str, Any], i
             scale = getattr(descriptor, "scale", 1)
             arch_name = getattr(getattr(descriptor, "architecture", None), "name", "SpandrelModel")
             meta = {"arch": arch_name, "scale": scale, "spandrel": True}
+            if device is not None:
+                model = model.to(device)
             return model, meta, scale
     except Exception:
         pass
@@ -113,11 +122,19 @@ def export_fft_onnx(
     dynamic: bool = True,
     opset: int = 17,
     normalized: int = 1,
+    device: str | torch.device | None = None,
 ) -> dict[str, Any]:
     """Exports PyTorch FFT model to ONNX with ai.onnx.contrib plugins."""
+    if device is None:
+        try:
+            device = next(model.parameters()).device
+        except Exception:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    model = model.to(device)
     register_fft_symbolics(opset=opset, normalized=normalized)
 
-    dummy = torch.randn(1, 3, tile_size, tile_size, dtype=torch.float32)
+    dummy = torch.randn(1, 3, tile_size, tile_size, dtype=torch.float32, device=device)
     with torch.no_grad():
         out = model(dummy)
 
