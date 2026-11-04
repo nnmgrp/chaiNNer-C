@@ -62,6 +62,9 @@ def load_plugins() -> None:
 
     if PLUGIN_LIBRARY.is_file():
         tensorrt.get_plugin_registry().load_library(str(PLUGIN_LIBRARY))
+    dft_library = Path(__file__).with_name("trt_dft_plugins.dll")
+    if dft_library.is_file():
+        tensorrt.get_plugin_registry().load_library(str(dft_library))
 
 
 Size = tuple[int, int]
