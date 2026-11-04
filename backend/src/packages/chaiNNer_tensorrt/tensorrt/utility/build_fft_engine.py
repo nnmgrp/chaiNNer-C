@@ -34,20 +34,13 @@ from .. import utility_group
 
 def locate_dft_plugin() -> Path:
     """Locate the TensorRT DFT plugin DLL."""
-    cur_dir = Path(__file__).resolve().parent
-    # 1. Look in nodes/impl/tensorrt/trt_dft_plugins.dll
-    cand1 = cur_dir.parent.parent.parent / "nodes" / "impl" / "tensorrt" / "trt_dft_plugins.dll"
+    cand1 = dual.SOURCE / "nodes" / "impl" / "tensorrt" / "trt_dft_plugins.dll"
     if cand1.is_file():
         return cand1
-    # 2. Look in python tensorrt_libs
     site_packages = Path(sys.executable).parent / "Lib" / "site-packages"
     cand2 = site_packages / "tensorrt_libs" / "trt_dft_plugins.dll"
     if cand2.is_file():
         return cand2
-    # 3. Fallback to prebuilt in converter
-    cand3 = Path(r"F:\Downloads\FFT_to_TRT-Converter\prebuilt\win64_cuda13_trt11\trt_dft_plugins.dll")
-    if cand3.is_file():
-        return cand3
     return cand1
 
 
@@ -102,7 +95,6 @@ if utility_group is not None:
         settings = get_settings(context)
         gpu_index = settings.gpu_index
         plugin_dll = locate_dft_plugin()
-        backend_root = Path(__file__).resolve().parent.parent.parent.parent
 
         def build() -> TensorRTEngine:
             logger.info("Starting Build FFT Engine for: %s", model_path.name)
@@ -141,9 +133,9 @@ if utility_group is not None:
                         "1" if dynamic_shapes else "0",
                         str(tile_size),
                     ],
-                    label="FFT Engine Build",
-                    cwd=backend_root,
-                    context=context,
+                    "FFT Engine Build",
+                    dual.SOURCE,
+                    context,
                 )
                 logger.info("[FFT] TensorRT compilation finished.")
 
