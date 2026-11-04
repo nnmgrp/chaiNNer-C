@@ -21,8 +21,7 @@ from nodes.properties.outputs import (
 )
 from nodes.impl.compressed_file import read_file
 from nodes.impl.tensorrt.cache import engines
-from nodes.impl.tensorrt.engine_info import deserialize_engine, read_engine_info
-from nodes.impl.tensorrt.model import TensorRTEngine
+from nodes.impl.tensorrt.model import TensorRTEngine, TensorRTEngineInfo
 from nodes.impl.tensorrt.build_cache import cached_engine
 from nodes.impl.tensorrt.memory import get_cuda_device_name, get_cuda_compute_capability
 from nodes.impl.tensorrt import dual
@@ -86,7 +85,7 @@ if utility_group is not None:
         context: NodeContext,
         model_path: Path,
         tile_size: int = 256,
-        dynamic_shapes: bool = True,
+        dynamic_shapes: bool = False,
         fp16: bool = True,
         workspace_mb: int = 2048,
     ) -> tuple[TensorRTEngine, Path, str]:
@@ -110,7 +109,7 @@ if utility_group is not None:
                 # 1. Load model and export to ONNX
                 logger.info("[FFT] Loading model and exporting to ONNX...")
                 model, meta, scale = load_fft_model(model_path)
-                norm_val = meta.get("normalized", 1)
+                norm_val = int(meta.get("normalized", 0))
                 export_fft_onnx(
                     model=model,
                     output_path=temp_onnx,
@@ -142,12 +141,29 @@ if utility_group is not None:
                 )
                 logger.info("[FFT] TensorRT compilation finished.")
 
-                from nodes.impl.tensorrt.drft import load_plugins
-                load_plugins()
-
                 engine_bytes = read_file(temp_engine)
-                loaded = deserialize_engine(engine_bytes, gpu_index)
-                return TensorRTEngine(engine_bytes, read_engine_info(loaded), loaded)
+                major, minor = get_cuda_compute_capability(gpu_index)
+                min_shape = (1, 3, 64, 64) if dynamic_shapes else (1, 3, tile_size, tile_size)
+                opt_shape = (1, 3, tile_size, tile_size)
+                max_shape = (
+                    (1, 3, max(tile_size * 2, 512), max(tile_size * 2, 512))
+                    if dynamic_shapes
+                    else (1, 3, tile_size, tile_size)
+                )
+
+                info = TensorRTEngineInfo(
+                    precision="fp16" if fp16 else "fp32",
+                    input_channels=3,
+                    output_channels=3,
+                    scale=scale,
+                    gpu_architecture=f"sm_{major}{minor}",
+                    tensorrt_version=trt.__version__,
+                    has_dynamic_shapes=dynamic_shapes,
+                    min_shape=min_shape,
+                    opt_shape=opt_shape,
+                    max_shape=max_shape,
+                )
+                return TensorRTEngine(engine_bytes, info)
 
         # Build cache key
         model_stat = os.stat(model_path)
