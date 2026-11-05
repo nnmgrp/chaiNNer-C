@@ -5,6 +5,10 @@ on:
   push:
     branches: [nvenc-stage1]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -21,6 +25,12 @@ jobs:
         run: |
           git log -2 --oneline
           git status --short
+
+      - name: Optimize Windows Runner (disable Defender scanning)
+        shell: pwsh
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath 'C:\Executables', 'C:\Tools', (Get-Location).Path -ErrorAction SilentlyContinue
 
       - name: Setup MSVC 14.44 and Windows SDK
         shell: pwsh
@@ -75,8 +85,17 @@ jobs:
           $llvm = 'C:\Executables\clang+llvm-23.1.2-x86_64-pc-windows-msvc'
           New-Item -ItemType Directory -Force C:\Executables | Out-Null
           $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/clang+llvm-23.1.2-x86_64-pc-windows-msvc.tar.xz'
+          Write-Host "Downloading LLVM 23.1.2 with curl..."
           curl.exe -fSL $url -o C:\Executables\llvm.tar.xz
-          tar -xf C:\Executables\llvm.tar.xz -C C:\Executables
+          
+          $7z = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $7z) { $7z = 'C:\Program Files\7-Zip\7z.exe' }
+          Write-Host "Extracting xz layer via 7-Zip ($7z)..."
+          & $7z x C:\Executables\llvm.tar.xz -oC:\Executables -y | Out-Null
+          Write-Host "Extracting tar layer via 7-Zip ($7z)..."
+          & $7z x C:\Executables\llvm.tar -oC:\Executables -y | Out-Null
+          Remove-Item C:\Executables\llvm.tar, C:\Executables\llvm.tar.xz -Force
+
           if (-not (Test-Path "$llvm\bin\clang-cl.exe")) { throw "clang-cl not found after extraction" }
           & "$llvm\bin\clang-cl.exe" --version
           "LLVM_DIR=$llvm" >> $env:GITHUB_ENV
@@ -87,7 +106,10 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
           $zip = 'C:\Executables\nasm.zip'
           curl.exe -fSL 'https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip' -o $zip
-          Expand-Archive $zip -DestinationPath C:\Executables -Force
+          $7z = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $7z) { $7z = 'C:\Program Files\7-Zip\7z.exe' }
+          & $7z x $zip -oC:\Executables -y | Out-Null
+          Remove-Item $zip -Force
           $nasm = (Get-ChildItem C:\Executables -Recurse -Filter nasm.exe | Select-Object -First 1).FullName
           if (-not $nasm) { throw "nasm.exe not found" }
           & $nasm -v
