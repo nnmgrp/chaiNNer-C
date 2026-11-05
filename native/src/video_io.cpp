@@ -48,6 +48,7 @@ O call(const O&f, const py::tuple&a=py::tuple(), const py::dict&k=py::dict()) {
     return own(PyObject_Call(f.ptr(),a.ptr(),k.ptr()));
 }
 O fmt(const char*p,const O&v) { return py::str(p).attr("format")(v); }
+O fmt(const char*p,const O&v1,const O&v2) { return py::str(p).attr("format")(v1,v2); }
 [[noreturn]] void fail(PyObject *type,const char*message) { graphpy::raise(type,py::str(message)); }
 O function_label(const O&f) {return py::str("{}.{}()").attr("format")(f.attr("__module__"),f.attr("__qualname__"));}
 py::dict keyword_mapping(const O&f,const O&mapping) {
