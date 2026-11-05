@@ -3,7 +3,7 @@ name: native-nvenc
 on:
   workflow_dispatch:
   push:
-    branches: [nvenc-stage1]
+    branches: [nvenc-stage1, chaiNNer-C]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
