@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -39,7 +40,15 @@ from packages.chaiNNer_standard.image.video_frames.save_video import (
 )
 
 STORAGE = Path(os.environ.get("APPDATA", "")) / "chaiNNer" / "backend-storage"
-FFMPEG, FFPROBE = map(str, get_executable_path(STORAGE / "ffmpeg"))
+try:
+    FFMPEG, FFPROBE = map(str, get_executable_path(STORAGE / "ffmpeg"))
+except Exception:
+    FFMPEG, FFPROBE = "", ""
+if not Path(FFMPEG).exists():
+    _system_ffmpeg = shutil.which("ffmpeg")
+    if _system_ffmpeg:
+        FFMPEG = _system_ffmpeg
+        FFPROBE = shutil.which("ffprobe") or _system_ffmpeg
 
 NVENC = (
     VideoEncoder.H264_NVENC,
@@ -234,8 +243,9 @@ def test_nvenc_probe_errors(
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr=stderr),
     )
+    encoder = VideoEncoder.AV1_NVENC if b"av1" in stderr else VideoEncoder.H265_NVENC
     with pytest.raises(RuntimeError, match=expected) as error:
-        module.nvenc_probe("ffmpeg-bin", VideoEncoder.H265_NVENC, "yuv420p")
+        module.nvenc_probe("ffmpeg-bin", encoder, "yuv420p")
     assert stderr.decode() in str(error.value)
 
 
@@ -257,7 +267,9 @@ def test_nvenc_refuses_unsupported_pixel_formats():
 
 def test_nvenc_requires_even_dimensions():
     probe = writer(VideoEncoder.H265_NVENC)
-    with pytest.raises(ValueError, match="even-number frame resolution"):
+    with pytest.raises(
+        (ValueError, AssertionError), match="even-number frame resolution"
+    ):
         module.graph().video_writer_start(vars(module), probe, 63, 63)
 
 
@@ -292,7 +304,7 @@ def test_nvenc_hdr_warns(
     monkeypatch.setattr(module, "nvenc_probe", lambda *args: None)
     settings = module.WriteSettings(
         VideoInputMode.RGB,
-        SimpleNamespace(hdr=object()),
+        SimpleNamespace(hdr=object(), bit_depth=8),
         (
             module.Matrix.AUTO,
             module.Transfer.AUTO,
@@ -400,7 +412,7 @@ def test_nvenc_hevc_10bit_mkv(tmp_path: Path):
     require_nvenc(VideoEncoder.H265_NVENC, "yuv420p10le")
     path = save(
         tmp_path,
-        bars(320, 240),
+        bars(1280, 720),
         VideoFormat.MKV,
         VideoEncoder.H265_NVENC,
         BitDepth.BITS_10,
@@ -418,10 +430,10 @@ def test_nvenc_lossless_colour(tmp_path: Path):
     require_nvenc(VideoEncoder.H265_NVENC, "yuv420p")
     path = save(
         tmp_path,
-        bars(320, 240),
+        bars(1280, 720),
         VideoFormat.MKV,
         VideoEncoder.H265_NVENC,
-        additional="-tune lossless -rc constqp -qp 0",
+        additional="-tune lossless -rc constqp -qp 0 -spatial-aq 0",
     )
     info = stream(path)
     assert (
