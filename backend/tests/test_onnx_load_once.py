@@ -18,8 +18,7 @@ from nodes.impl.compressed_file import Compression
 from nodes.impl.native_onnx_runtime import NativeSession
 from nodes.impl.onnx import load as load_module
 from nodes.impl.onnx.load import load_onnx_model, model_facts
-from nodes.impl.onnx.model import ARCH_METADATA_KEY
-from nodes.impl.onnx.model import MIXED, OnnxGeneric, OnnxInfo
+from nodes.impl.onnx.model import ARCH_METADATA_KEY, MIXED, OnnxGeneric, OnnxInfo
 from nodes.impl.onnx.session import create_inference_session
 from nodes.impl.tensorrt.dual import METADATA_KEY
 from packages.chaiNNer_onnx.onnx.io.load_model import load_model_node
@@ -185,6 +184,8 @@ def test_a_record_on_a_model_that_is_not_fp16_is_left_out():
 
 
 def test_a_record_of_another_architecture_is_left_out():
-    loaded = load_onnx_model(gain_model({ARCH_METADATA_KEY: "Other"}).SerializeToString())
+    loaded = load_onnx_model(
+        gain_model({ARCH_METADATA_KEY: "Other"}).SerializeToString()
+    )
     assert model_facts(loaded).arch is None
     assert loaded.info.arch is None

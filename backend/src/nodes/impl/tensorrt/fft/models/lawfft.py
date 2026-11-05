@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 lawfft.py - Standalone LAWFFT model architecture for PyTorch & TensorRT export.
 Architecture designed by umzi2 (https://github.com/umzi2) in resselt (https://github.com/rewaifu/resselt).
@@ -8,14 +7,11 @@ Local Adaptive Weighted Fourier Feature Transformer.
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple, Dict, Any, List, Literal
+from typing import Any, Literal
 
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 # Global normalization mode for FFT custom operators in LAWFFT:
 # 0 = "backward" (PyTorch default used in LAWFFT)
@@ -113,7 +109,9 @@ class DySample(nn.Module):
             .unsqueeze(0)
             .type(x.dtype)
         )
-        normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
+        normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).view(
+            1, 2, 1, 1, 1
+        )
         coords = 2 * (coords + offset) / normalizer - 1
         coords = (
             F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
@@ -145,7 +143,7 @@ class UniUpsample(nn.Sequential):
         mid_dim: int = 64,
         group: int = 4,
     ) -> None:
-        m: List[nn.Module] = []
+        m: list[nn.Module] = []
         if upsample == "pixelshuffledirect":
             m.append(nn.Conv2d(in_dim, out_dim * scale**2, 3, 1, 1))
             m.append(nn.PixelShuffle(scale))
@@ -216,6 +214,7 @@ class LayerNorm(nn.Module):
 
 class FSAS(nn.Module):
     """Fourier Spatial Attention Sub-block with windowed / full FFT."""
+
     def __init__(
         self,
         dim: int = 64,
@@ -244,16 +243,32 @@ class FSAS(nn.Module):
         hidden = self.to_hidden(x)
         q, k, v = self.to_hidden_dw(hidden).chunk(3, dim=1)
 
-        norm_str = "ortho" if self.normalized == 1 else "backward"
-
         if self.patch:
             B, C, H, W = q.shape
-            q_patch = q.view(
-                B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size
-            ).permute(0, 1, 2, 4, 3, 5).contiguous()
-            k_patch = k.view(
-                B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size
-            ).permute(0, 1, 2, 4, 3, 5).contiguous()
+            q_patch = (
+                q.view(
+                    B,
+                    C,
+                    H // self.patch_size,
+                    self.patch_size,
+                    W // self.patch_size,
+                    self.patch_size,
+                )
+                .permute(0, 1, 2, 4, 3, 5)
+                .contiguous()
+            )
+            k_patch = (
+                k.view(
+                    B,
+                    C,
+                    H // self.patch_size,
+                    self.patch_size,
+                    W // self.patch_size,
+                    self.patch_size,
+                )
+                .permute(0, 1, 2, 4, 3, 5)
+                .contiguous()
+            )
 
             q_fft = LawfftRFFT2.apply(q_patch.float(), self.normalized)
             k_fft = LawfftRFFT2.apply(k_patch.float(), self.normalized)
@@ -310,10 +325,14 @@ class SFSAS(nn.Module):
         local = int(split * dim)
         global_dim = dim - local
         self.local = nn.Sequential(DynamicLocal(local), DynamicLocal(local, 5))
-        self.att = FSAS(global_dim, t_mid_factor, window_size, windowed, normalized=normalized)
+        self.att = FSAS(
+            global_dim, t_mid_factor, window_size, windowed, normalized=normalized
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        local, glob = torch.split(x, [self.local[0].conv.in_channels, self.att.to_hidden.in_channels], dim=1)
+        local, glob = torch.split(
+            x, [self.local[0].conv.in_channels, self.att.to_hidden.in_channels], dim=1
+        )
         return torch.cat([self.local(local), self.att(glob)], dim=1)
 
 
@@ -344,7 +363,9 @@ class MetaBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.norm = LayerNorm(dim)
-        self.att = SFSAS(dim, split, t_mid_factor, window_size, windowed, normalized=normalized)
+        self.att = SFSAS(
+            dim, split, t_mid_factor, window_size, windowed, normalized=normalized
+        )
         self.norm2 = LayerNorm(dim)
         self.ffn = FeedForward(dim, mlp_factor)
 
@@ -367,7 +388,15 @@ class ResidualMeta(nn.Module):
         super().__init__()
         self.residual = nn.Sequential(
             *[
-                MetaBlock(dim, split, t_mid_factor, window_size, bool(i % 2), mlp, normalized=normalized)
+                MetaBlock(
+                    dim,
+                    split,
+                    t_mid_factor,
+                    window_size,
+                    bool(i % 2),
+                    mlp,
+                    normalized=normalized,
+                )
                 for i in range(meta_b)
             ]
             + [DynamicLocal(dim)]
@@ -458,7 +487,7 @@ class LAWFFT(nn.Module):
         return x
 
 
-def detect_lawfft_params(state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+def detect_lawfft_params(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
     """Inspects LAWFFT state_dict to deduce all hyperparameters."""
     params = {
         "in_ch": 3,
@@ -512,7 +541,13 @@ def detect_lawfft_params(state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
     if "upscale.MetaUpsample" in state_dict:
         meta = state_dict["upscale.MetaUpsample"].cpu().numpy()
         if len(meta) >= 7:
-            sample_mods = ["conv", "pixelshuffledirect", "pixelshuffle", "nearest+conv", "dysample"]
+            sample_mods = [
+                "conv",
+                "pixelshuffledirect",
+                "pixelshuffle",
+                "nearest+conv",
+                "dysample",
+            ]
             idx = int(meta[1])
             if idx < len(sample_mods):
                 params["upsampler"] = sample_mods[idx]

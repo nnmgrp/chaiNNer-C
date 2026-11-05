@@ -7,7 +7,7 @@ from .lawfft import LAWFFT, detect_lawfft_params
 
 __all__ = [
     "GFISRV2",
-    "detect_gfisrv2_params",
     "LAWFFT",
+    "detect_gfisrv2_params",
     "detect_lawfft_params",
 ]

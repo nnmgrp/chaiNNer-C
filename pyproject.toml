@@ -12,8 +12,12 @@ indent-width = 4
 
 src = ["backend/src"]
 
-# ignore vendored code
-extend-exclude = ["**/pytorch/architecture/**", "backend/src/vendor/**"]
+# ignore vendored code and model architectures
+extend-exclude = [
+    "**/pytorch/architecture/**",
+    "backend/src/vendor/**",
+    "backend/src/nodes/impl/tensorrt/fft/models/**",
+]
 
 unsafe-fixes = true
 
@@ -68,6 +72,7 @@ ignore = [
     "ISC001",  # Implicit string concatenation, conflicts with formatter
     "PLC0415", # Import outside top level: deliberate lazy imports (torch/onnx/scipy only where used; native_* <-> image_utils cycle; native tests sequence DLL loads)
     "PLC0414", # Useless import alias: x as x is the PEP 484 explicit export that marks names the native mirrors read through globals() (F401 and pyright honour it)
+    "RUF012",  # Mutable class attributes (ctypes.Structure _fields_)
 ]
 
 [tool.ruff.format]
@@ -91,6 +96,8 @@ ignore-names = ["*Input", "*Output", "*Dropdown"]
 # Type stubs must use the names of the external APIs they describe
 # (cudaMalloc, cudaError_t, cudaSuccess, ...), which pep8-naming rejects.
 "stubs/cuda/**/*.pyi" = ["N801", "N802", "N815", "N816"]
+# Tests legitimately inspect internal class structures for unit verification
+"backend/tests/**" = ["SLF001"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning", "ignore::UserWarning"]

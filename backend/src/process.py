@@ -120,7 +120,6 @@ def collect_input_information(
 def enforce_inputs(
     inputs: list[object], node: NodeData, node_id: NodeId, ignored_inputs: list[InputId]
 ) -> list[object]:
-
     def enforce(i: BaseInput, value: object) -> object:
         if i.id in ignored_inputs:
             return None
@@ -2498,7 +2497,6 @@ class Executor:
     def __send_node_progress(
         self, node: Node, times: Sequence[float], index: int, length: int
     ):
-
         def get_eta(times: Sequence[float]) -> float:
             avg_time = 0
             if len(times) > 0:
@@ -2538,7 +2536,6 @@ class Executor:
     async def __send_node_broadcast(
         self, node: Node, output: Output, generators: Iterable[Generator] | None = None
     ):
-
         def compute_broadcast_data():
             if self.progress.aborted:
                 return None

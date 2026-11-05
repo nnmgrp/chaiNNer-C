@@ -30,12 +30,18 @@ def _written_out(
             axes = f"{output}_axes"
             axis = numpy_helper.from_array(np.array([2], np.int64))
             nodes.append(helper.make_node("Constant", [], [axes], value=axis))
-            nodes.append(helper.make_node("ReduceMean", [values, axes], [output], keepdims=1))
+            nodes.append(
+                helper.make_node("ReduceMean", [values, axes], [output], keepdims=1)
+            )
         else:
-            nodes.append(helper.make_node("ReduceMean", [values], [output], axes=[2], keepdims=1))
+            nodes.append(
+                helper.make_node("ReduceMean", [values], [output], axes=[2], keepdims=1)
+            )
 
     mean(source, f"{name}_mean")
-    nodes.append(helper.make_node("Sub", [source, f"{name}_mean"], [f"{name}_deviation"]))
+    nodes.append(
+        helper.make_node("Sub", [source, f"{name}_mean"], [f"{name}_deviation"])
+    )
     nodes.append(
         helper.make_node(
             "Mul", [f"{name}_deviation", f"{name}_deviation"], [f"{name}_square"]
@@ -51,7 +57,9 @@ def _written_out(
         )
     )
     nodes.append(
-        helper.make_node("Add", [f"{name}_variance", f"{name}_epsilon"], [f"{name}_sum"])
+        helper.make_node(
+            "Add", [f"{name}_variance", f"{name}_epsilon"], [f"{name}_sum"]
+        )
     )
     nodes.append(helper.make_node("Sqrt", [f"{name}_sum"], [f"{name}_root"]))
     nodes.append(helper.make_node("Div", [f"{name}_deviation", f"{name}_root"], [name]))
@@ -81,7 +89,11 @@ def written_out_group_norm(
     makers = {output: node for node in graph.node for output in node.output}
     initializers = {tensor.name: tensor for tensor in graph.initializer}
     opset = next(
-        (entry.version for entry in model.opset_import if entry.domain in ("", "ai.onnx")),
+        (
+            entry.version
+            for entry in model.opset_import
+            if entry.domain in ("", "ai.onnx")
+        ),
         None,
     )
     if opset is None:
@@ -95,12 +107,18 @@ def written_out_group_norm(
             if maker.attribute[0].name != "value":
                 return None
             return numpy_helper.to_array(maker.attribute[0].t)
-        return numpy_helper.to_array(initializers[name]) if name in initializers else None
+        return (
+            numpy_helper.to_array(initializers[name]) if name in initializers else None
+        )
 
     nodes: list[onnx.NodeProto] = []
     rewritten = False
     for node in graph.node:
-        reshape = makers.get(node.input[0]) if node.op_type == "InstanceNormalization" else None
+        reshape = (
+            makers.get(node.input[0])
+            if node.op_type == "InstanceNormalization"
+            else None
+        )
         target = None
         if reshape is not None and reshape.op_type == "Reshape":
             target = constant(reshape.input[1])

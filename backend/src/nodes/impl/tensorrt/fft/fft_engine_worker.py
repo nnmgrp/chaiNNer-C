@@ -39,7 +39,8 @@ def main(
 
     if is_pytorch:
         import torch
-        from nodes.impl.tensorrt.fft.fft_export import load_fft_model, export_fft_onnx
+
+        from nodes.impl.tensorrt.fft.fft_export import export_fft_onnx, load_fft_model
 
         device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
         print(f"[WORKER] Loading FFT model on {device}...")
@@ -47,7 +48,9 @@ def main(
         norm_val = int(meta.get("normalized", 0))
 
         temp_onnx = Path(engine_path).with_suffix(".tmp.onnx")
-        print(f"[WORKER] Exporting to ONNX on {device} (tile={tile_size}, dynamic={dynamic == '1'})...")
+        print(
+            f"[WORKER] Exporting to ONNX on {device} (tile={tile_size}, dynamic={dynamic == '1'})..."
+        )
         export_fft_onnx(
             model=model,
             output_path=temp_onnx,
@@ -131,10 +134,22 @@ def main(
                 min_s = 64
                 opt_s = max(t_size, 128)
                 max_s = max(t_size * 2, 512)
-                profile.set_shape(input_name, (1, 3, min_s, min_s), (1, 3, opt_s, opt_s), (1, 3, max_s, max_s))
-                print(f"[WORKER] Dynamic profile: min=({min_s}x{min_s}), opt=({opt_s}x{opt_s}), max=({max_s}x{max_s})")
+                profile.set_shape(
+                    input_name,
+                    (1, 3, min_s, min_s),
+                    (1, 3, opt_s, opt_s),
+                    (1, 3, max_s, max_s),
+                )
+                print(
+                    f"[WORKER] Dynamic profile: min=({min_s}x{min_s}), opt=({opt_s}x{opt_s}), max=({max_s}x{max_s})"
+                )
             else:
-                profile.set_shape(input_name, (1, 3, t_size, t_size), (1, 3, t_size, t_size), (1, 3, t_size, t_size))
+                profile.set_shape(
+                    input_name,
+                    (1, 3, t_size, t_size),
+                    (1, 3, t_size, t_size),
+                    (1, 3, t_size, t_size),
+                )
                 print(f"[WORKER] Fixed profile: ({t_size}x{t_size})")
 
             config.add_optimization_profile(profile)
@@ -162,7 +177,9 @@ def main(
 
 if __name__ == "__main__":
     if len(sys.argv) < 9:
-        print("Usage: python -m nodes.impl.tensorrt.fft.fft_engine_worker <input_path> <engine> <gpu> <plugin> <workspace_mb> <fp16> <dynamic> <tile_size> [meta_json]")
+        print(
+            "Usage: python -m nodes.impl.tensorrt.fft.fft_engine_worker <input_path> <engine> <gpu> <plugin> <workspace_mb> <fp16> <dynamic> <tile_size> [meta_json]"
+        )
         sys.exit(1)
     meta_json = sys.argv[9] if len(sys.argv) >= 10 else None
     main(*sys.argv[1:9], meta_json_path=meta_json)

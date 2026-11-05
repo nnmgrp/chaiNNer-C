@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
-import json
 import tempfile
-import hashlib
 from pathlib import Path
 
 from sanic.log import logger
 
 from api import NodeContext
+from nodes.impl.compressed_file import read_file
+from nodes.impl.tensorrt import dual
+from nodes.impl.tensorrt.build_cache import cached_engine
+from nodes.impl.tensorrt.memory import get_cuda_compute_capability, get_cuda_device_name
+from nodes.impl.tensorrt.model import TensorRTEngine, TensorRTEngineInfo
 from nodes.properties.inputs import (
     BoolInput,
     NumberInput,
@@ -20,13 +25,7 @@ from nodes.properties.outputs import (
     FileNameOutput,
     TensorRTEngineOutput,
 )
-from nodes.impl.compressed_file import read_file
-from nodes.impl.tensorrt.cache import engines
-from nodes.impl.tensorrt.model import TensorRTEngine, TensorRTEngineInfo
-from nodes.impl.tensorrt.build_cache import cached_engine
-from nodes.impl.tensorrt.memory import get_cuda_device_name, get_cuda_compute_capability
-from nodes.impl.tensorrt import dual
-from nodes.utils.utils import file_identity, split_file_path
+from nodes.utils.utils import split_file_path
 
 from ...settings import get_settings
 from .. import utility_group
@@ -62,7 +61,9 @@ if utility_group is not None:
         icon="BsNvidia",
         inputs=[
             PthFileInput(primary_input=False),
-            NumberInput("Tile Size", default=256, min=64, max=1024, step=64, unit="px").with_docs(
+            NumberInput(
+                "Tile Size", default=256, min=64, max=1024, step=64, unit="px"
+            ).with_docs(
                 "Spatial tile size for inference. Larger tiles (256, 512) significantly reduce tiling overhead."
             ),
             BoolInput("Dynamic Shapes", default=False).with_docs(
@@ -71,7 +72,9 @@ if utility_group is not None:
             BoolInput("FP16", default=True).with_docs(
                 "Enable FP16 precision for faster inference and lower VRAM usage."
             ),
-            NumberInput("Workspace (MB)", default=2048, min=512, max=16384, step=512).with_docs(
+            NumberInput(
+                "Workspace (MB)", default=2048, min=512, max=16384, step=512
+            ).with_docs(
                 "Maximum GPU workspace memory allocated for TensorRT kernel autotuning."
             ),
         ],
@@ -107,7 +110,9 @@ if utility_group is not None:
                 meta_json = Path(temp_dir) / "meta.json"
 
                 # Build TensorRT Engine via worker child process
-                logger.info("[FFT] Exporting model and compiling TensorRT engine in worker child process...")
+                logger.info(
+                    "[FFT] Exporting model and compiling TensorRT engine in worker child process..."
+                )
                 dual.run_child(
                     [
                         "-m",
@@ -131,13 +136,19 @@ if utility_group is not None:
                 scale = 1
                 if meta_json.is_file():
                     try:
-                        scale = int(json.loads(meta_json.read_text(encoding="utf-8")).get("scale", 1))
+                        scale = int(
+                            json.loads(meta_json.read_text(encoding="utf-8")).get(
+                                "scale", 1
+                            )
+                        )
                     except Exception:
                         pass
 
                 engine_bytes = read_file(temp_engine)
                 major, minor = get_cuda_compute_capability(gpu_index)
-                min_shape = (1, 3, 64, 64) if dynamic_shapes else (1, 3, tile_size, tile_size)
+                min_shape = (
+                    (1, 3, 64, 64) if dynamic_shapes else (1, 3, tile_size, tile_size)
+                )
                 opt_shape = (1, 3, tile_size, tile_size)
                 max_shape = (
                     (1, 3, max(tile_size * 2, 512), max(tile_size * 2, 512))
@@ -162,9 +173,7 @@ if utility_group is not None:
         # Build cache key
         model_stat = os.stat(model_path)
         cache_key = hashlib.sha256(
-            f"{model_path.name}_{model_stat.st_size}_{model_stat.st_mtime}_{tile_size}_{dynamic_shapes}_{fp16}_{workspace_mb}_{trt.__version__}_{get_cuda_device_name(gpu_index)}".encode(
-                "utf-8"
-            )
+            f"{model_path.name}_{model_stat.st_size}_{model_stat.st_mtime}_{tile_size}_{dynamic_shapes}_{fp16}_{workspace_mb}_{trt.__version__}_{get_cuda_device_name(gpu_index)}".encode()
         ).hexdigest()
 
         engine = cached_engine(cache_key, build, settings.engine_cache_path)

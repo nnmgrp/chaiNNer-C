@@ -251,7 +251,7 @@ def test_nvenc_refuses_unsupported_pixel_formats():
             output_params={"pix_fmt": fmt, "vcodec": encoder.value},
         )
         with pytest.raises(ValueError, match="4:2:0") as error:
-            probe._check_pixel_format(64, 64)  # noqa: SLF001
+            probe._check_pixel_format(64, 64)
         assert wanted in str(error.value)
 
 
@@ -303,7 +303,7 @@ def test_nvenc_hdr_warns(
         BitDepth.AUTO,
         SitingCorrection.AUTO,
     )
-    writer(VideoEncoder.H265_NVENC, settings=settings)._check_nvenc()  # noqa: SLF001
+    writer(VideoEncoder.H265_NVENC, settings=settings)._check_nvenc()
     assert "NVENC does not write HDR10 mastering metadata" in caplog.text
 
 

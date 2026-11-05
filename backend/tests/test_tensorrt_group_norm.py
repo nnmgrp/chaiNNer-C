@@ -110,7 +110,9 @@ def test_a_reshape_whose_shape_is_another_constant_form_stays_as_it_is(tmp_path:
     del model.graph.initializer[:]
     model.graph.initializer.extend(kept)
     nodes = [n for n in model.graph.node if name not in n.output]
-    nodes.insert(0, onnx.helper.make_node("Constant", [], [name], value_ints=[0, 4, -1]))
+    nodes.insert(
+        0, onnx.helper.make_node("Constant", [], [name], value_ints=[0, 4, -1])
+    )
     del model.graph.node[:]
     model.graph.node.extend(nodes)
     data = model.SerializeToString()

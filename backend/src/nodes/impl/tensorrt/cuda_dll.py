@@ -30,7 +30,10 @@ def discover_cuda_dll_directories() -> list[str]:
     # 2. Python environment site-packages (tensorrt_libs, nvidia/cu*, nvidia/cuda_*, etc.)
     site_packages = Path(sys.executable).parent / "Lib" / "site-packages"
     if site_packages.is_dir():
-        for cand in [site_packages / "tensorrt_libs"] + list(site_packages.glob("nvidia/*/bin")):
+        for cand in [
+            site_packages / "tensorrt_libs",
+            *list(site_packages.glob("nvidia/*/bin")),
+        ]:
             if cand.is_dir():
                 dirs.add(str(cand.resolve()))
 
@@ -39,7 +42,9 @@ def discover_cuda_dll_directories() -> list[str]:
         drive_path = Path(f"{drive_letter}:\\")
         if not drive_path.exists():
             continue
-        cuda_base = drive_path / "Program Files" / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        cuda_base = (
+            drive_path / "Program Files" / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        )
         if cuda_base.is_dir():
             try:
                 for ver_dir in cuda_base.iterdir():

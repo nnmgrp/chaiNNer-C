@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 gfisrv2.py - Standalone GFISRV2 model architecture for PyTorch & TensorRT export.
 Architecture designed by umzi2 (https://github.com/umzi2) in resselt (https://github.com/rewaifu/resselt).
@@ -9,13 +8,11 @@ Zero external Spandrel dependencies; exports clean ai.onnx.contrib::Rfft / Irfft
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Any
 
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 # Global normalization mode for FFT custom operators:
 # 1 = "ortho" (normalized by 1/sqrt(N) in both directions; native in updated plugin)
@@ -157,7 +154,9 @@ class DySample(nn.Module):
             .unsqueeze(0)
             .type(x.dtype)
         )
-        normalizer = torch.tensor([w, h], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
+        normalizer = torch.tensor([w, h], dtype=x.dtype, device=x.device).view(
+            1, 2, 1, 1, 1
+        )
         coords = 2 * (coords + offset) / normalizer - 1
         coords = (
             F.pixel_shuffle(coords.reshape(b, -1, h, w), self.scale)
@@ -213,7 +212,12 @@ class RMSNorm(nn.Module):
 
 
 class FourierUnit(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, normalized: int = DEFAULT_FFT_NORMALIZED) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        normalized: int = DEFAULT_FFT_NORMALIZED,
+    ) -> None:
         super().__init__()
         self.rn = RMSNorm(out_channels * 2)
         self.post_norm = RMSNorm(out_channels)
@@ -260,10 +264,26 @@ class InceptionDWConv2d(nn.Module):
         super().__init__()
         gc = int(in_channels * branch_ratio)
         self.convs = [
-            FourierUnit(in_channels - 3 * gc, in_channels - 3 * gc, normalized=normalized),
-            nn.Conv2d(gc, gc, square_kernel_size, padding=square_kernel_size // 2, groups=gc),
-            nn.Conv2d(gc, gc, kernel_size=(1, band_kernel_size), padding=(0, band_kernel_size // 2), groups=gc),
-            nn.Conv2d(gc, gc, kernel_size=(band_kernel_size, 1), padding=(band_kernel_size // 2, 0), groups=gc),
+            FourierUnit(
+                in_channels - 3 * gc, in_channels - 3 * gc, normalized=normalized
+            ),
+            nn.Conv2d(
+                gc, gc, square_kernel_size, padding=square_kernel_size // 2, groups=gc
+            ),
+            nn.Conv2d(
+                gc,
+                gc,
+                kernel_size=(1, band_kernel_size),
+                padding=(0, band_kernel_size // 2),
+                groups=gc,
+            ),
+            nn.Conv2d(
+                gc,
+                gc,
+                kernel_size=(band_kernel_size, 1),
+                padding=(band_kernel_size // 2, 0),
+                groups=gc,
+            ),
         ]
         self.pconv = self.convs[shift % 4]
         self.dwconv_hw = self.convs[(shift + 1) % 4]
@@ -338,7 +358,7 @@ class UniUpsampleV3(nn.Sequential):
         group: int = 4,
         dysample_end_kernel: int = 1,
     ) -> None:
-        m: List[nn.Module] = []
+        m: list[nn.Module] = []
         if upsample == "pixelshuffledirect":
             m.append(nn.Conv2d(in_dim, out_dim * scale**2, 3, 1, 1))
             m.append(nn.PixelShuffle(scale))
@@ -385,7 +405,15 @@ class UniUpsampleV3(nn.Sequential):
         self.register_buffer(
             "MetaUpsample",
             torch.tensor(
-                [3, SAMPLE_MODS.index(upsample), scale, in_dim, out_dim, mid_dim, group],
+                [
+                    3,
+                    SAMPLE_MODS.index(upsample),
+                    scale,
+                    in_dim,
+                    out_dim,
+                    mid_dim,
+                    group,
+                ],
                 dtype=torch.uint8,
             ),
         )
@@ -441,7 +469,7 @@ class GFISRV2(nn.Module):
         )
         self.scale = scale
 
-    def load_state_dict(self, state_dict: Dict[str, Any], *args, **kwargs):
+    def load_state_dict(self, state_dict: dict[str, Any], *args, **kwargs):
         if "upscale.MetaUpsample" not in state_dict:
             state_dict["upscale.MetaUpsample"] = self.upscale.MetaUpsample
         return super().load_state_dict(state_dict, *args, **kwargs)
@@ -455,7 +483,7 @@ class GFISRV2(nn.Module):
         return out[:, :, : h * self.true_scale, : w * self.true_scale]
 
 
-def detect_gfisrv2_params(state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+def detect_gfisrv2_params(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
     """Inspects GFISRV2 state_dict to deduce all hyperparameters."""
     params = {
         "in_nc": 3,
@@ -506,7 +534,7 @@ def detect_gfisrv2_params(state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]
                 out_nc = params.get("out_nc", 3)
                 if out_ch % out_nc == 0:
                     scale_sq = out_ch // out_nc
-                    detected_scale = int(math.isqrt(scale_sq))
+                    detected_scale = math.isqrt(scale_sq)
                     if detected_scale * detected_scale == scale_sq:
                         params["scale"] = detected_scale
 
