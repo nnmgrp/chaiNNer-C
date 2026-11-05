@@ -41,23 +41,14 @@ export interface GitHubRelease {
     date: string;
 }
 
-// Releases are re-released under the same tag, so the same version is an update when its tree
-// differs and it was committed later. A development build's tree means nothing: newer versions
-// only.
+// Only notify when there is a strictly newer semantic version (e.g. 0.3.10 > 0.3.9).
+// Do not trigger re-release notifications when the version is the same.
 export const isUpdateAvailable = (
     release: GitHubRelease,
     version: Version,
-    build: BuildInfo
+    _build: BuildInfo
 ): boolean => {
-    if (versionGt(release.version, version)) {
-        return true;
-    }
-    return (
-        !isDevelopmentBuild(build) &&
-        release.version === parse(version) &&
-        release.tree !== build.tree &&
-        Date.parse(release.date) > Date.parse(build.date)
-    );
+    return versionGt(release.version, version);
 };
 
 // "Don't show again for this release" stores this key: ignoring one re-release keeps the next.

@@ -208,12 +208,12 @@ package = add_package(
             # layout MIGraphX fuses, on request; c12 runs depthwise 3x3 convolutions
             # and ESRGAN's dense blocks on HIP kernels under ROCm; c13 runs DUAL's
             # inference with fewer passes over memory.
-            version="0.4.2+c13",
+            version="0.4.2+c13.1",
             size_estimate=600 * KB,
             url=(
-                "https://github.com/Rift73/spandrel/releases/download/v0.4.2-c13/"
-                "spandrel-0.4.2%2Bc13-py3-none-any.whl"
-                "#sha256=20e149794cf16a4f4fbb2930173ffca3ad5264fa585c1acf1c672e019e418950"
+                "https://github.com/nnmgrp/spandrel/releases/download/v0.4.2-c13.1/"
+                "spandrel-0.4.2%2Bc13.1-py3-none-any.whl"
+                "#sha256=f55033b4b542c82bfb14d66b4ebc5088c06a1c663c137e9f643d0dfb51692024"
             ),
         ),
         Dependency(
