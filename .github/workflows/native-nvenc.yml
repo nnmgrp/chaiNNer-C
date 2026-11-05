@@ -71,10 +71,11 @@ jobs:
       - name: Install LLVM 23.1.2
         shell: pwsh
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           $llvm = 'C:\Executables\clang+llvm-23.1.2-x86_64-pc-windows-msvc'
           New-Item -ItemType Directory -Force C:\Executables | Out-Null
           $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/clang+llvm-23.1.2-x86_64-pc-windows-msvc.tar.xz'
-          Invoke-WebRequest -Uri $url -OutFile C:\Executables\llvm.tar.xz
+          curl.exe -fSL $url -o C:\Executables\llvm.tar.xz
           tar -xf C:\Executables\llvm.tar.xz -C C:\Executables
           if (-not (Test-Path "$llvm\bin\clang-cl.exe")) { throw "clang-cl not found after extraction" }
           & "$llvm\bin\clang-cl.exe" --version
@@ -83,8 +84,9 @@ jobs:
       - name: Install NASM 3.01
         shell: pwsh
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           $zip = 'C:\Executables\nasm.zip'
-          Invoke-WebRequest 'https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip' -OutFile $zip
+          curl.exe -fSL 'https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip' -o $zip
           Expand-Archive $zip -DestinationPath C:\Executables -Force
           $nasm = (Get-ChildItem C:\Executables -Recurse -Filter nasm.exe | Select-Object -First 1).FullName
           if (-not $nasm) { throw "nasm.exe not found" }
