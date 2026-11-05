@@ -35,6 +35,7 @@ from packages.chaiNNer_standard.image.video_frames import save_video as module
 from packages.chaiNNer_standard.image.video_frames.save_video import (
     AudioSettings,
     BitDepth,
+    NvencPreset,
     SimpleVideoFormat,
     Simplicity,
     SitingCorrection,
@@ -137,6 +138,8 @@ def save(
         VideoFormat.MKV,
         VideoEncoder.FFV1,
         VideoPreset.ULTRA_FAST,
+        23,
+        NvencPreset.P5,
         23,
         additional,
         SimpleVideoFormat.MP4_H264,

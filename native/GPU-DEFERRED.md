@@ -11,9 +11,10 @@ rules of 2026-10-07:
 
 | # | Item | Why it needs the GPU | Origin |
 | --- | --- | --- | --- |
-| 27 | Cached TensorRT session reuse and teardown on its owning device, including a different worker thread | B16 is source-reviewed only; multi-GPU behavior cannot be confirmed on this one-GPU machine | hunt-20261021, review |
-| 28 | Low-headroom PyTorch offload admission reaches normal tile splitting instead of an invalid allocator fraction | B17 raises a CUDA OutOfMemoryError before allocator changes; actual constrained VRAM is untested | hunt-20261021, review |
+| 27 | Cached TensorRT session reuse and teardown on its owning device, including a different worker thread | B16 is source-reviewed only; multi-GPU behavior cannot be confirmed on this one-GPU machine | hunt-20261021, review || 28 | Low-headroom PyTorch offload admission reaches normal tile splitting instead of an invalid allocator fraction | B17 raises a CUDA OutOfMemoryError before allocator changes; actual constrained VRAM is untested | hunt-20261021, review |
 | 29 | Large DUAL activation restore succeeds after non-input eviction, all operation inputs protected | B18 has only the approved CPU stand-in check; real large-input VRAM confirmation is explicitly deferred | hunt-20261021, review |
+| 30 | Save Video NVENC functional tests (approved 2026-11-05): H.264/HEVC/AV1 4:2:0 8/10-bit round trips, colour tags, probe errors; at most ~100 MB VRAM per session (one 256×144 frame for the probe) | A real NVIDIA GPU and driver | NVENC Stage 1 |
+| 31 | Save Video NVENC acceptance benchmark (parked, needs approval): 1080p and 4K HEVC 10-bit/AV1, 50 timed iterations per side against libx265 | A real NVIDIA GPU; benchmarks are not approved | NVENC Stage 1 |
 | 2 | Retired 2026-10-05: the nightly's GPU lease was removed on the decision, so there is nothing left to check | — | SP1 |
 | 3 | Model-inference throughput (Upscale Image) under the new scheduler and pipelining. In progress 2026-10-07: four ESRGAN cases (PyTorch 1x/4x, ONNX CUDA, NCNN Vulkan), one paired run of 48 images per side each, exactness port = oracle and port vs installed (lane `u4/gpu`, report `u4gpu-report.md`) | Inference workloads are excluded from CPU benchmarks | SP2, SP3 |
 | 4 | Retired 2026-10-07 (Consult 17): PGO training with real models. The build decision is ThinLTO with no PGO | — | SP5 |

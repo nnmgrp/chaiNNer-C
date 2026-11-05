@@ -2,8 +2,11 @@ from __future__ import annotations
 
 # `x as x` imports: the native mirror reads these names in native/src/video_io.cpp
 import os as os
+import subprocess
+import sys
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from subprocess import Popen
 from typing import Any, Literal
@@ -79,7 +82,10 @@ class VideoFormat(Enum):
 
     @property
     def encoders(self) -> tuple[VideoEncoder, ...]:
-        return graph().video_container_encoders(globals(), self)
+        encoders = graph().video_container_encoders(globals(), self)
+        if sys.platform == "darwin":
+            return tuple(e for e in encoders if not e.nvenc)
+        return encoders
 
 
 class VideoEncoder(Enum):
@@ -87,6 +93,17 @@ class VideoEncoder(Enum):
     H265 = "libx265"
     VP9 = "libvpx-vp9"
     FFV1 = "ffv1"
+    H264_NVENC = "h264_nvenc"
+    H265_NVENC = "hevc_nvenc"
+    AV1_NVENC = "av1_nvenc"
+
+    @property
+    def nvenc(self) -> bool:
+        return self in (
+            VideoEncoder.H264_NVENC,
+            VideoEncoder.H265_NVENC,
+            VideoEncoder.AV1_NVENC,
+        )
 
     @property
     def formats(self) -> tuple[VideoFormat, ...]:
@@ -101,12 +118,20 @@ class VideoEncoder(Enum):
             VideoEncoder.H265: (8, 10, 12),
             VideoEncoder.VP9: (8, 10, 12),
             VideoEncoder.FFV1: (8, 9, 10, 12, 14, 16),
+            VideoEncoder.H264_NVENC: (8,),
+            VideoEncoder.H265_NVENC: (8, 10),
+            VideoEncoder.AV1_NVENC: (8, 10),
         }[self]
 
     @property
     def pixel_formats(self) -> tuple[str, ...]:
         """The YUV and RGB pixel formats the encoder takes in chaiNNer's FFmpeg 5.1.2,
         of those Save Video writes."""
+        if self.nvenc:
+            return tuple(
+                "yuv420p" if depth == 8 else f"yuv420p{depth}le"
+                for depth in self.bit_depths
+            )
         depths = ["" if depth == 8 else f"{depth}le" for depth in self.bit_depths]
         layouts = ("420", "422", "444")
         formats = [f"yuv{layout}p{depth}" for layout in layouts for depth in depths]
@@ -120,9 +145,14 @@ class VideoEncoder(Enum):
     def auto_depth(self) -> int | None:
         """The most bits Bit Depth Auto gives the encoder: what players commonly
         decode (H.264 8, H.265 and VP9 10); FFV1 keeps the source's."""
-        return {VideoEncoder.H264: 8, VideoEncoder.H265: 10, VideoEncoder.VP9: 10}.get(
-            self
-        )
+        return {
+            VideoEncoder.H264: 8,
+            VideoEncoder.H265: 10,
+            VideoEncoder.VP9: 10,
+            VideoEncoder.H264_NVENC: 8,
+            VideoEncoder.H265_NVENC: 10,
+            VideoEncoder.AV1_NVENC: 10,
+        }.get(self)
 
 
 class VideoPreset(Enum):
@@ -134,6 +164,16 @@ class VideoPreset(Enum):
     SLOW = "slow"
     SLOWER = "slower"
     VERY_SLOW = "veryslow"
+
+
+class NvencPreset(Enum):
+    P1 = "p1"
+    P2 = "p2"
+    P3 = "p3"
+    P4 = "p4"
+    P5 = "p5"
+    P6 = "p6"
+    P7 = "p7"
 
 
 class AudioSettings(Enum):
@@ -179,12 +219,101 @@ def get_simple_format(
     return graph().video_simple_format(globals(), simple_video_format, quality)
 
 
-PARAMETERS: dict[VideoEncoder, list[Literal["preset", "crf"]]] = {
+PARAMETERS: dict[
+    VideoEncoder, list[Literal["preset", "crf", "nvenc_preset", "nvenc_cq"]]
+] = {
     VideoEncoder.H264: ["preset", "crf"],
     VideoEncoder.H265: ["preset", "crf"],
     VideoEncoder.VP9: ["crf"],
     VideoEncoder.FFV1: [],
+    VideoEncoder.H264_NVENC: ["nvenc_preset", "nvenc_cq"],
+    VideoEncoder.H265_NVENC: ["nvenc_preset", "nvenc_cq"],
+    VideoEncoder.AV1_NVENC: ["nvenc_preset", "nvenc_cq"],
 }
+
+
+# (FFmpeg path, encoder, pixel format) combinations proven to encode on this machine.
+# lru_cache keeps successes (failures raise and are not cached), so a freed NVENC session
+# can be retried.
+@lru_cache(maxsize=None)
+def nvenc_probe(ffmpeg_path: str, encoder: VideoEncoder, pix_fmt: str) -> None:
+    """Encodes one 256x144 frame to FFmpeg's null muxer to prove that `encoder` and
+    `pix_fmt` work with this build, driver and GPU (~340 ms, nothing written to disk).
+    Success is cached; a failure raises with the NVIDIA-specific cause."""
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=256x144:r=1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        encoder.value,
+        "-pix_fmt",
+        pix_fmt,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=30,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            "The NVENC check timed out after 30 s; the NVIDIA driver may be unresponsive."
+        ) from error
+    if result.returncode == 0:
+        return
+    stderr = result.stderr.decode(errors="replace").strip()
+    codec = {
+        VideoEncoder.H264_NVENC: "H.264",
+        VideoEncoder.H265_NVENC: "HEVC",
+        VideoEncoder.AV1_NVENC: "AV1",
+    }[encoder]
+    if f"Unknown encoder '{encoder.value}'" in stderr:
+        message = (
+            "This FFmpeg build has no NVENC. Reinstall chaiNNer-C or update FFmpeg."
+        )
+    elif "Cannot load nvcuda.dll" in stderr or "Cannot load libcuda.so.1" in stderr:
+        message = (
+            "NVENC needs an NVIDIA driver, but none was found. Install/update the"
+            " NVIDIA driver or choose a CPU encoder."
+        )
+    elif "Driver does not support the required nvenc API version" in stderr:
+        message = (
+            "The NVIDIA driver is too old for this FFmpeg's NVENC SDK. Update the driver"
+            " (the message names the required version)."
+        )
+    elif "No capable devices found" in stderr:
+        message = (
+            f"This GPU has no {codec} NVENC encoder (AV1 needs RTX 40 or newer). Choose"
+            " H.265 NVENC or a CPU encoder."
+        )
+    elif "OpenEncodeSessionEx failed" in stderr or "out of memory" in stderr:
+        message = (
+            "NVIDIA limits concurrent NVENC sessions. Another Save Video may be encoding;"
+            " serialize the runs or choose a CPU encoder."
+        )
+    elif "10 bit encode not supported" in stderr:
+        message = (
+            f"This GPU's {codec} NVENC has no 10-bit support. Choose 8-bit or another"
+            " encoder."
+        )
+    elif "Unsupported pixel format" in stderr:
+        message = f"NVENC writes 4:2:0 8/10-bit only; {pix_fmt} is not supported."
+    else:
+        message = f"NVENC failed to start: {stderr[-500:]}"
+    raise RuntimeError(f"{message}\n{stderr}")
 
 
 @dataclass(frozen=True)
@@ -258,7 +387,46 @@ class Writer:
 
     def start(self, width: int, height: int):
         # Create the writer and run process
+        try:
+            self._check_nvenc()
+        except Exception:
+            if self.target is not None:
+                self.target.abandon()  # The probe ran before FFmpeg made any file.
+            raise
         graph().video_writer_start(globals(), self, width, height)
+
+    def _check_nvenc(self) -> None:
+        """Proves the NVENC encoder and the output's pixel format work before FFmpeg
+        starts, so an unsupported GPU, driver or format fails without a CPU fallback."""
+        encoder = self.encoder
+        if encoder is None or not encoder.nvenc:
+            return
+        nvenc_probe(self.ffmpeg_env.ffmpeg, encoder, self._output_pixel_format())
+        settings = self.settings
+        if settings is not None and settings.colour is not None:
+            if settings.colour.hdr is not None:
+                logger.warning(
+                    "NVENC does not write HDR10 mastering metadata; use libx265 if you"
+                    " need it."
+                )
+
+    def _output_pixel_format(self) -> str:
+        """The pixel format the encoder writes, as the probe should test it: the planes'
+        own, or the output's yuv420p raised to the chosen bit depth (a user -pix_fmt
+        wins)."""
+        coding = self.coding
+        if coding is not None:
+            return planar_format(coding)
+        params = self.output_params
+        fmt = (
+            str(params.get("pix_fmt", "yuv420p"))
+            if hasattr(params, "get")
+            else "yuv420p"
+        )
+        depth = self._bit_depth()
+        if depth > 8 and fmt == "yuv420p":
+            return f"yuv420p{depth}le"
+        return fmt
 
     def write_frame(self, frame: object, prepared: Prepared | None = None):
         """Writes a frame: an image, or Save Video's iterated inputs (Image Sequence,
@@ -651,6 +819,12 @@ class Writer:
         encoder = next(
             (e for e in VideoEncoder if e.value == params.get("vcodec")), None
         )
+        if encoder is not None and encoder.nvenc and fmt not in encoder.pixel_formats:
+            depths = " or ".join(str(depth) for depth in encoder.bit_depths)
+            raise ValueError(
+                f"{encoder.value} writes 4:2:0 at {depths} bits, not {fmt}. Choose"
+                " 4:2:0, a lower Bit Depth, or a CPU encoder (libx265/FFV1)."
+            )
         if encoder is None or not fmt.startswith(("yuv4", "gbrp")):
             return
         if fmt not in encoder.pixel_formats:
@@ -713,6 +887,8 @@ def frame_collector(
     encoder: VideoEncoder,
     video_preset: VideoPreset,
     crf: int,
+    nvenc_preset: NvencPreset,
+    nvenc_cq: int,
     additional_parameters: str | None,
     simple_video_format: SimpleVideoFormat,
     quality: int,
@@ -741,6 +917,8 @@ def frame_collector(
         encoder,
         video_preset,
         crf,
+        nvenc_preset,
+        nvenc_cq,
         fps,
         simplicity,
         additional_parameters,
@@ -786,6 +964,7 @@ def frame_collector(
     description=[
         "Combines an iterable sequence into a video, which it saves to a file.",
         "Uses FFMPEG to write video files.",
+        "Advanced mode can encode with NVIDIA NVENC (H.264, H.265, AV1) on Windows and Linux with a compatible GPU.",
         "This iterator is much slower than just using FFMPEG directly, so if you are doing a simple conversion, just use FFMPEG outside chaiNNer instead.",
     ],
     icon="MdVideoCameraBack",
@@ -843,12 +1022,24 @@ def frame_collector(
                     VideoEncoder.H265: "H.265 (HEVC)",
                     VideoEncoder.VP9: "VP9",
                     VideoEncoder.FFV1: "FFV1",
+                    VideoEncoder.H264_NVENC: "H.264 (NVENC)",
+                    VideoEncoder.H265_NVENC: "H.265 (NVENC)",
+                    VideoEncoder.AV1_NVENC: "AV1 (NVENC)",
                 },
                 conditions={
                     VideoEncoder.H264: Condition.enum(4, VideoEncoder.H264.formats),
                     VideoEncoder.H265: Condition.enum(4, VideoEncoder.H265.formats),
                     VideoEncoder.VP9: Condition.enum(4, VideoEncoder.VP9.formats),
                     VideoEncoder.FFV1: Condition.enum(4, VideoEncoder.FFV1.formats),
+                    VideoEncoder.H264_NVENC: Condition.enum(
+                        4, VideoEncoder.H264_NVENC.formats
+                    ),
+                    VideoEncoder.H265_NVENC: Condition.enum(
+                        4, VideoEncoder.H265_NVENC.formats
+                    ),
+                    VideoEncoder.AV1_NVENC: Condition.enum(
+                        4, VideoEncoder.AV1_NVENC.formats
+                    ),
                 },
             )
             .with_id(3)
@@ -877,6 +1068,39 @@ def frame_collector(
                     "For more information on CRF, see [here](https://trac.ffmpeg.org/wiki/Encode/H.264#crf)."
                 )
                 .with_id(9),
+            ),
+            if_enum_group(
+                3,
+                (
+                    VideoEncoder.H264_NVENC,
+                    VideoEncoder.H265_NVENC,
+                    VideoEncoder.AV1_NVENC,
+                ),
+            )(
+                EnumInput(
+                    NvencPreset,
+                    label="NVENC Preset",
+                    label_style="inline",
+                    default=NvencPreset.P5,
+                )
+                .with_docs(
+                    "P1 is the fastest and lowest quality, P7 the slowest and best; P5 is"
+                    " a good default."
+                )
+                .with_id(31),
+                SliderInput(
+                    "CQ",
+                    min=1,
+                    max=51,
+                    default=23,
+                    ends=("Best", "Worst"),
+                )
+                .with_docs(
+                    "NVENC's constant quality (lower is better). 0 means automatic, so"
+                    " the slider starts at 1; AV1's values above 51 are available through"
+                    " Additional parameters (-cq)."
+                )
+                .with_id(32),
             ),
             TextInput(
                 "Additional parameters",
@@ -993,6 +1217,8 @@ def save_video_node(
     encoder: VideoEncoder,
     video_preset: VideoPreset,
     crf: int,
+    nvenc_preset: NvencPreset,
+    nvenc_cq: int,
     additional_parameters: str | None,
     simple_video_format: SimpleVideoFormat,
     quality: int,
@@ -1026,6 +1252,8 @@ def save_video_node(
             encoder,
             video_preset,
             crf,
+            nvenc_preset,
+            nvenc_cq,
             additional_parameters,
             simple_video_format,
             quality,
@@ -1045,6 +1273,8 @@ def save_video_node(
         encoder,
         video_preset,
         crf,
+        nvenc_preset,
+        nvenc_cq,
         additional_parameters,
         simple_video_format,
         quality,

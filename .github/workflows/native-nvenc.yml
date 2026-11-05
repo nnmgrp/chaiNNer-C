@@ -1,0 +1,140 @@
+name: native-nvenc
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [nvenc-stage1]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show branch state
+        shell: pwsh
+        run: |
+          git log -2 --oneline
+          git status --short
+
+      - name: Install pinned VS 2022 17.14.0 Build Tools
+        shell: pwsh
+        run: |
+          $installer = 'C:\Executables\vs_BuildTools_17.14.0.exe'
+          New-Item -ItemType Directory -Force C:\Executables | Out-Null
+          Invoke-WebRequest `
+            'https://download.visualstudio.microsoft.com/download/pr/f50ab15d-99d5-43aa-b0b4-496b6cb1e574/8e8630e8383f68b7d2110c409dc7b2df6ae3ac92254612952eeb6a1e40207105/vs_BuildTools.exe' `
+            -OutFile $installer
+          & $installer --quiet --wait --norestart --nocache `
+            --installPath 'C:\BuildTools' `
+            --add Microsoft.VisualStudio.Workload.VCTools `
+            --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            --add Microsoft.VisualStudio.Component.Windows11SDK.26100 `
+            --includeRecommended
+          if ($LASTEXITCODE -notin 0, 3010) { throw "VS installer failed ($LASTEXITCODE)" }
+
+          $msvc = 'C:\BuildTools\VC\Tools\MSVC\14.44.35207'
+          if (-not (Test-Path $msvc)) {
+            $have = (Get-ChildItem 'C:\BuildTools\VC\Tools\MSVC' -Directory).Name -join ', '
+            throw "VS 17.14.0 did not install MSVC 14.44.35207; have: $have"
+          }
+
+          $sdk = 'C:\Program Files (x86)\Windows Kits\10'
+          if (-not (Test-Path (Join-Path $sdk 'Include\10.0.26100.0'))) {
+            throw "Windows SDK 10.0.26100.0 not found under $sdk"
+          }
+
+          $ninja = (Get-ChildItem 'C:\BuildTools' -Recurse -Filter ninja.exe | Select-Object -First 1).FullName
+          if (-not $ninja) { $ninja = (Get-Command ninja).Source }
+
+          "MSVC_DIR=$msvc"   >> $env:GITHUB_ENV
+          "SDK_DIR=$sdk"     >> $env:GITHUB_ENV
+          "NINJA=$ninja"     >> $env:GITHUB_ENV
+
+      - name: Install LLVM 23.1.2
+        shell: pwsh
+        run: |
+          $llvm = 'C:\Executables\clang+llvm-23.1.2-x86_64-pc-windows-msvc'
+          $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/clang+llvm-23.1.2-x86_64-pc-windows-msvc.tar.xz'
+          Invoke-WebRequest -Uri $url -OutFile C:\Executables\llvm.tar.xz
+          tar -xf C:\Executables\llvm.tar.xz -C C:\Executables
+          if (-not (Test-Path "$llvm\bin\clang-cl.exe")) { throw "clang-cl not found after extraction" }
+          & "$llvm\bin\clang-cl.exe" --version
+          "LLVM_DIR=$llvm" >> $env:GITHUB_ENV
+
+      - name: Install NASM 3.01
+        shell: pwsh
+        run: |
+          $zip = 'C:\Executables\nasm.zip'
+          Invoke-WebRequest 'https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip' -OutFile $zip
+          Expand-Archive $zip -DestinationPath C:\Executables -Force
+          $nasm = (Get-ChildItem C:\Executables -Recurse -Filter nasm.exe | Select-Object -First 1).FullName
+          if (-not $nasm) { throw "nasm.exe not found" }
+          & $nasm -v
+          "NASM=$nasm" >> $env:GITHUB_ENV
+
+      - name: Provision build Python
+        shell: pwsh
+        run: powershell -NoProfile -File native\tools\provision_runtime.ps1 -BuildOnly
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          & '.\native\Build.ps1' -Configuration Release `
+            -Ninja $env:NINJA `
+            -Define "chainner_c_llvm=$env:LLVM_DIR\bin", `
+                    "chainner_c_vc_tools=$env:MSVC_DIR", `
+                    "chainner_c_sdk=$env:SDK_DIR", `
+                    "CHAINNER_C_NASM=$env:NASM"
+          if ($LASTEXITCODE -ne 0) { throw "Build failed ($LASTEXITCODE)" }
+
+      - name: Check artifacts
+        shell: pwsh
+        run: |
+          $impl = 'backend\src\nodes\impl'
+          foreach ($f in '_chainner_graph.pyd', 'chainner_native.dll') {
+            $p = Join-Path $impl $f
+            if (-not (Test-Path $p)) { throw "Missing $p" }
+            Get-FileHash $p -Algorithm SHA256 | Format-List
+            Get-Item $p | Select-Object FullName, Length, LastWriteTime
+          }
+
+      - name: Smoke-test the new module
+        shell: pwsh
+        run: |
+          $py = '.\native\runtime\cpython-3.14.8\python.exe'
+          & $py -B -c @"
+          import sys
+          from enum import Enum
+          sys.path.insert(0, r'backend/src')
+          import nodes.impl._chainner_graph as mod
+          assert mod.abi_version == 1
+          class VideoFormat(Enum):
+              MKV='mkv'; MP4='mp4'; MOV='mov'; WEBM='webm'; AVI='avi'; GIF='gif'
+          class VideoEncoder(Enum):
+              H264='libx264'; H264_NVENC='h264_nvenc'; H265='libx265'
+              H265_NVENC='hevc_nvenc'; AV1_NVENC='av1_nvenc'; VP9='libvpx-vp9'; FFV1='ffv1'
+          g = {'VideoFormat': VideoFormat, 'VideoEncoder': VideoEncoder}
+          mkv = [e.value for e in mod.video_container_encoders(g, VideoFormat.MKV)]
+          webm = [e.value for e in mod.video_container_encoders(g, VideoFormat.WEBM)]
+          avi = [e.value for e in mod.video_container_encoders(g, VideoFormat.AVI)]
+          print('MKV', mkv); print('WEBM', webm); print('AVI', avi)
+          assert {'h264_nvenc', 'hevc_nvenc', 'av1_nvenc'} <= set(mkv)
+          assert webm == ['libvpx-vp9', 'av1_nvenc']
+          assert avi == ['libx264']
+          print('NVENC module OK')
+          "@
+
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chainner-native-nvenc
+          path: |
+            backend/src/nodes/impl/_chainner_graph.pyd
+            backend/src/nodes/impl/chainner_native.dll
+          if-no-files-found: error

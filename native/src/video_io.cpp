@@ -228,10 +228,10 @@ O audio_stream(const py::dict&g,const O&self,const O&duration) {
 O container_encoders(const py::dict&g,const O&self) {
     for(const auto &entry: {"MKV","MP4","MOV","WEBM","AVI","GIF"}) {
         if(!eq(self,member(g,"VideoFormat",entry)))continue;
-        if(std::string(entry)=="MKV")return py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H265"),member(g,"VideoEncoder","VP9"),member(g,"VideoEncoder","FFV1"));
-        if(std::string(entry)=="MP4")return py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H265"),member(g,"VideoEncoder","VP9"));
-        if(std::string(entry)=="MOV")return py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H265"));
-        if(std::string(entry)=="WEBM")return py::make_tuple(member(g,"VideoEncoder","VP9"));
+        if(std::string(entry)=="MKV")return py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H264_NVENC"),member(g,"VideoEncoder","H265"),member(g,"VideoEncoder","H265_NVENC"),member(g,"VideoEncoder","AV1_NVENC"),member(g,"VideoEncoder","VP9"),member(g,"VideoEncoder","FFV1"));
+        if(std::string(entry)=="MP4")return py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H264_NVENC"),member(g,"VideoEncoder","H265"),member(g,"VideoEncoder","H265_NVENC"),member(g,"VideoEncoder","AV1_NVENC"),member(g,"VideoEncoder","VP9"));
+        if(std::string(entry)=="MOV")return py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H264_NVENC"),member(g,"VideoEncoder","H265"),member(g,"VideoEncoder","H265_NVENC"));
+        if(std::string(entry)=="WEBM")return py::make_tuple(member(g,"VideoEncoder","VP9"),member(g,"VideoEncoder","AV1_NVENC"));
         if(std::string(entry)=="AVI")return py::make_tuple(member(g,"VideoEncoder","H264"));
         return py::tuple();
     }
@@ -475,7 +475,7 @@ std::shared_ptr<WriterResource> resource(const O&self) {
 bool writer_open(const py::dict&g,const O&self,const O&width,const O&height,bool launch) {
     if(!self.attr("out").is_none())return true;
     if(resource(self)->aborted)fail(PyExc_RuntimeError,"Video writer was aborted");
-    if(graphpy::contains(py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H265")),self.attr("encoder")))
+    if(graphpy::contains(py::make_tuple(member(g,"VideoEncoder","H264"),member(g,"VideoEncoder","H265"),member(g,"VideoEncoder","H264_NVENC"),member(g,"VideoEncoder","H265_NVENC"),member(g,"VideoEncoder","AV1_NVENC")),self.attr("encoder")))
         graphpy::require(eq(mod(height,py::int_(2)),py::int_(0)) && eq(mod(width,py::int_(2)),py::int_(0)),
             fmt("The \"{}\" encoder requires an even-number frame resolution.",self.attr("encoder").attr("value")));
     try {
@@ -758,13 +758,26 @@ void writer_close(const py::dict&g,const O&self) {
 // option and a lone "-flag" a global option; a key Save Video sets itself raises. A run of
 // one chosen frame reads them too (save_video.py frame_collector).
 py::tuple output_options(const py::dict&g,const O&filename,const O&container,const O&encoder,const O&preset,const O&crf,
-    const O&fps,const O&simplicity,O additional) {
+    const O&nvenc_preset,const O&nvenc_cq,const O&fps,const O&simplicity,O additional) {
     py::dict params=dict({{"filename",filename},{"format",container.attr("muxer")},{"pix_fmt",py::str("yuv420p")},{"r",fps},{"movflags",py::str("faststart")}});
+    // A chain opened with an NVENC encoder on a platform whose FFmpeg has none (macOS) must
+    // fail instead of leaving vcodec unset, where FFmpeg would encode with libx264.
+    if(truth(encoder.attr("nvenc")) && !graphpy::contains(container.attr("encoders"),encoder))
+        graphpy::raise(PyExc_ValueError,fmt("The {} container does not support the {} encoder.",container.attr("value"),encoder.attr("value")));
     if(graphpy::contains(container.attr("encoders"),encoder)) {
         params["vcodec"]=encoder.attr("value");
         O allowed=global(g,"PARAMETERS")[encoder];
         if(graphpy::contains(allowed,py::str("preset")))params["preset"]=preset.attr("value");
         if(graphpy::contains(allowed,py::str("crf")))params["crf"]=crf;
+        if(graphpy::contains(allowed,py::str("nvenc_preset"))) {
+            params["preset"]=nvenc_preset.attr("value");
+            params["tune"]="hq";
+            params["rc"]="vbr";
+            params["cq"]=nvenc_cq;
+            params["b:v"]=0;
+            params["multipass"]="qres";
+            params["spatial-aq"]=1;
+        }
     }
     py::list globals;
     if(eq(simplicity,member(g,"Simplicity","ADVANCED")) && !additional.is_none()) {
@@ -787,7 +800,7 @@ py::tuple output_options(const py::dict&g,const O&filename,const O&container,con
 }
 
 O save_video(const py::dict&g,const O&context,O unused,const O&directory,const O&name,const O&simplicity,
-    O container,O encoder,O preset,O crf,O additional,const O&simple,const O&quality,const O&fps,O audio,const O&audio_settings,
+    O container,O encoder,O preset,O crf,O nvenc_preset,O nvenc_cq,O additional,const O&simple,const O&quality,const O&fps,O audio,const O&audio_settings,
     const O&settings) {
     (void)unused;
     if(eq(simplicity,member(g,"Simplicity","SIMPLE"))) {
@@ -807,7 +820,7 @@ O save_video(const py::dict&g,const O&context,O unused,const O&directory,const O
     // its .tmp name picks no muxer, so the extension's is named.
     O target=global(g,"atomic_target")(builtin("str")(path));
     target.attr("check")(); // a file the rename cannot replace fails now, not after the encode
-    py::tuple options=output_options(g,target.attr("temp"),container,encoder,preset,crf,fps,simplicity,additional);
+    py::tuple options=output_options(g,target.attr("temp"),container,encoder,preset,crf,nvenc_preset,nvenc_cq,fps,simplicity,additional);
     py::dict params=options[0].cast<py::dict>();
     py::list globals=options[1].cast<py::list>();
     // With audio, the mux writes the final file, which had no faststart while the encode

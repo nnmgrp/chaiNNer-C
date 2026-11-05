@@ -31,6 +31,7 @@ from nodes.impl.video import VideoLoader
 from packages.chaiNNer_standard.image.video_frames.save_video import (
     AudioSettings,
     BitDepth,
+    NvencPreset,
     SimpleVideoFormat,
     Simplicity,
     SitingCorrection,
@@ -127,6 +128,8 @@ def save(
         encoder,
         VideoPreset.ULTRA_FAST,
         0,
+        NvencPreset.P5,
+        23,
         additional,
         SimpleVideoFormat.MP4_H264,
         75,

@@ -528,6 +528,17 @@ chaiNNer (outputs may differ only here; the 13 bench graphs equal chaiNNer's at 
   to the pipe error, where upstream surfaces only `Broken pipe` or `[Errno 22]`; while FFmpeg still runs, the pipe
   error stands. The exit code at a successful close stays unchecked, as upstream; anything FFmpeg printed is logged as
   a warning instead of going to the backend's stderr. Output bytes are unchanged (`INTENDED_ENCODER_ERRORS`).
+- Save Video NVENC (approved 2026-11-05): Advanced mode offers H.264 (`h264_nvenc`, 8-bit), H.265
+  (`hevc_nvenc`, 8/10-bit) and AV1 (`av1_nvenc`, 8/10-bit) 4:2:0 on Windows and Linux, with separate P1–P7
+  presets and CQ 1–51 (`-rc vbr -cq N -b:v 0 -tune hq -multipass qres -spatial-aq 1`); macOS hides them.
+  The colour contract is unchanged (the CPU `scale`/`setparams` chain feeds the same tags and conversions), and
+  the encode stays an explicit choice: Simple mode and every existing chain keep their CPU encoders. A probe
+  (one 256×144 frame to the null muxer, cached per FFmpeg path, encoder and pixel format) runs before FFmpeg
+  starts, and a missing build, driver, GPU or format raises instead of silently falling back to a CPU encoder.
+  Frames must have even dimensions, as with the CPU H.264/H.265 encoders. NVENC writes no HDR10 mastering
+  metadata (a warning asks for libx265 when the Colour Info carries it). The output is nondeterministic and
+  outside the frozen oracle; GPU colour conversion (Stage 2) is deferred because the pinned FFmpeg's
+  `scale_cuda` has no RGB→YUV conversion or `out_color_matrix`/`out_range`.
 - Sibling event order (SP2): inputs awaited together (`owned_gather`, section 4) start and finish in pool-timing
   order, where upstream awaits inputs in turn (`start a, finish a, start b, finish b`). The event multiset and each
   node's final state are identical (`verify_runtime.event_contract` and `sse_contract` compare no order); item order

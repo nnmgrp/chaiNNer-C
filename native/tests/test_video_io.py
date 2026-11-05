@@ -951,6 +951,7 @@ def load(kind, component, env=None):
             "Path": Path,
             "np": np,
             "os": os,
+            "sys": sys,
             "math": math,
             "itertools": itertools,
             "ffmpeg": env,
@@ -1149,6 +1150,9 @@ REPLACED = {
         "outputs": {"Index"},
         "parameters": {"use_limit", "limit"},
     },
+    "save_video": {
+        "keywords": {"description"},
+    },
 }
 
 
@@ -1269,14 +1273,23 @@ def test_enum_compatibility(enum_name):
     for kind in ("installed", "native"):
         g = load(kind, "save_video")
         values.append(
-            [
-                snap(
+            {
+                v.value: snap(
                     getattr(v, "formats" if enum_name == "VideoEncoder" else "encoders")
                 )
                 for v in g[enum_name]
-            ]
+            }
         )
-    assert values[0] == values[1]
+    installed, native = values
+    # New values may be appended (NVENC encoders), but every installed one keeps its
+    # behaviour; a format's installed encoders keep their order among newer ones.
+    if enum_name == "VideoEncoder":
+        assert installed.items() <= native.items()
+    else:
+        assert set(installed) == set(native)
+        for name, encoders in installed.items():
+            kept = tuple(encoder for encoder in native[name] if encoder in encoders)
+            assert kept == encoders, name
 
 
 @pytest.mark.parametrize(
@@ -2070,6 +2083,8 @@ def node_args(g, context, directory, **changes):
         "encoder": g["VideoEncoder"].FFV1,
         "video_preset": g["VideoPreset"].MEDIUM,
         "crf": 23,
+        "nvenc_preset": g["NvencPreset"].P5,
+        "nvenc_cq": 23,
         "additional_parameters": None,
         "simple_video_format": g["SimpleVideoFormat"].MP4_H264,
         "quality": 75,
