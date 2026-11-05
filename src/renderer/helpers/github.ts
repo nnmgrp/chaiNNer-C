@@ -6,7 +6,7 @@ import type { RestEndpointMethodTypes } from '@octokit/rest';
 // It uses node modules and other node-only dependencies like node-fetch under the hood,
 // which mean that we cannot use in the browser. Instead, we use the fetch API directly.
 
-const repository = 'Rift73/chaiNNer-C';
+const repository = 'nnmgrp/chaiNNer-C';
 
 const fetchApi = async <T>(url: string, signal: AbortSignal): Promise<T> => {
     // fetch data from GitHub REST API

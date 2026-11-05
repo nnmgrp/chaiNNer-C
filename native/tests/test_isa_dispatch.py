@@ -329,7 +329,7 @@ def test_lib_names_the_dll_when_cn_isa_get_is_missing(monkeypatch, profile):
     monkeypatch.setattr(native_profile, "ProfiledCDLL", OldDll)
     with pytest.raises(
         RuntimeError,
-        match=r"Incompatible chaiNNer C kernel ABI at .*chainner_native\.dll: "
+        match=rf"Incompatible chaiNNer C kernel ABI at .*{re.escape(native.library_path().name)}: "
         r"no cn_isa_get export",
     ):
         native.lib.__wrapped__()
@@ -350,6 +350,6 @@ def test_setup_logs_the_isa_line_after_loading_nodes():
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
     )
     assert [ast.unparse(s) for s in setup.body] == [
-        "await import_packages(AppContext.get(sanic_app).config)",
+        "await import_packages(AppContext.get(sanic_app))",
         "logger.info(native.isa_line())",
     ]

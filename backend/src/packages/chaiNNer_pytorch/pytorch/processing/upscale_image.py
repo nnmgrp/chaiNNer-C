@@ -126,6 +126,7 @@ def upscale(
             tiler=parse_tile_size_input(tile_size, estimate),
             progress=progress,
             overlap=recommended_overlap,
+            use_bf16=options.use_cpu_bf16 and model.supports_bfloat16,
         )
         logger.debug("Done upscaling")
 

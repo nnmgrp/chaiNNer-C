@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -24,11 +25,17 @@ from dependencies.store import (
     filter_necessary_to_install,
     install_dependencies,
     installed_packages,
+    replaced,
     uninstall_dependencies,
+    unneeded_dependencies,
 )
 from events import BackendEventBroadcast
-from gpu import nvidia
+from gpu import amd, nvidia
 from nodes.impl.cors import add_cors
+from nodes.impl.vapoursynth.user_modules import (
+    install_user_modules,
+    missing_user_modules,
+)
 from response import (
     RESTART_WORKER_HEADER,
     error_response,
@@ -203,7 +210,33 @@ async def system_usage(_request: Request):
                 usage.used / usage.total * 100,
             )
         )
+    # AMD GPUs show without an NVIDIA GPU, those that run models: a GeForce laptop's Radeon
+    # graphics and a Ryzen's small graphics stay out. A GPU whose counters cannot be read (no
+    # sysfs folder in a sandbox, a missing Windows counter) is left out, logged once, so the
+    # CPU and RAM stats still show.
+    amd_gpus = [] if nvidia.devices else [gpu for gpu in amd.devices if gpu.eligible]
+    for gpu in amd_gpus:
+        try:
+            usage = gpu.get_current_vram_usage()
+        except (OSError, ValueError):
+            if gpu.index not in _unreadable_amd_gpus:
+                _unreadable_amd_gpus.add(gpu.index)
+                logger.warning(
+                    "The memory of %s cannot be read.", gpu.name, exc_info=True
+                )
+            continue
+        if usage.total > 0:
+            stats_list.append(
+                SystemStat(
+                    f"VRAM {gpu.index}" if len(amd_gpus) > 1 else "VRAM",
+                    usage.used / usage.total * 100,
+                )
+            )
     return json([asdict(x) for x in stats_list])
+
+
+# The AMD GPUs whose memory could not be read, by HIP index: logged once each.
+_unreadable_amd_gpus: set[int] = set()
 
 
 @app.route("/packages", methods=["GET"])
@@ -212,20 +245,26 @@ async def get_packages(request: Request):
     return await worker.proxy_request(request)
 
 
+def installed_versions(packages: list[api.Package]) -> dict[str, str]:
+    """The installed version of each dependency of the packages that is installed. A
+    build the dependency replaces (PyTorch's ROCm build where NVIDIA's is listed) is
+    not that dependency: the dependency manager shows it missing, to be installed."""
+    installed_deps: dict[str, str] = {}
+    for package in packages:
+        for pkg_dep in package.dependencies:
+            name = distribution_name(pkg_dep.pypi_name)
+            installed_version = installed_packages.get(name, None)
+            if installed_version is not None and not replaced(
+                pkg_dep.replaces, name, installed_version
+            ):
+                installed_deps[pkg_dep.pypi_name] = installed_version
+    return installed_deps
+
+
 @app.route("/installed-dependencies", methods=["GET"])
 async def get_installed_dependencies(request: Request):
     worker = await AppContext.get(request.app).get_worker()
-    installed_deps: dict[str, str] = {}
-    packages = await worker.get_packages()
-    for package in packages:
-        for pkg_dep in package.dependencies:
-            installed_version = installed_packages.get(
-                distribution_name(pkg_dep.pypi_name), None
-            )
-            if installed_version is not None:
-                installed_deps[pkg_dep.pypi_name] = installed_version
-
-    return json(installed_deps)
+    return json(installed_versions(await worker.get_packages()))
 
 
 @app.route("/features")
@@ -242,6 +281,7 @@ def deps_to_dep_info(deps: list[api.Dependency]) -> list[DependencyInfo]:
             version=dep.version,
             extra_index_url=dep.extra_index_url,
             url=dep.url,
+            replaces=dep.replaces,
         )
         for dep in deps
     ]
@@ -281,6 +321,27 @@ async def change_dependencies(
         await worker.start()
 
 
+def shared_distributions(
+    uninstalling: list[api.Package], packages: list[api.Package]
+) -> set[str]:
+    """The distributions of the packages to uninstall that a package staying installed
+    lists too, as the PyTorch, ONNX and MIGraphX packages list the same ROCm wheels on AMD
+    GPUs: uninstalling them would break it. A package stays installed while a
+    dependency that only it lists is installed."""
+    leaving_ids = {p.id for p in uninstalling}
+    leaving = {
+        distribution_name(d.pypi_name) for p in uninstalling for d in p.dependencies
+    }
+    shared: set[str] = set()
+    for package in packages:
+        if package.id in leaving_ids:
+            continue
+        own = {distribution_name(d.pypi_name) for d in package.dependencies}
+        if any(name in installed_packages for name in own - leaving):
+            shared |= own & leaving
+    return shared
+
+
 @app.route("/packages/uninstall", methods=["POST"])
 async def uninstall_dependencies_request(request: Request):
     package_ids_to_install: list[str] = request.json["packages"]
@@ -305,9 +366,36 @@ async def uninstall_dependencies_request(request: Request):
 
     try:
         progress = create_update_progress(ctx)
+        shared = shared_distributions(packages_to_install, packages)
         deps: list[DependencyInfo] = []
         for p in packages_to_install:
-            deps.extend(deps_to_dep_info(p.dependencies))
+            deps.extend(
+                d
+                for d in deps_to_dep_info(p.dependencies)
+                if d.distribution not in shared
+            )
+        # And what pip pulled in for them that nothing staying installed needs (about
+        # 1.8 GB for VapourSynth: vsview's PySide6, CUDA wheels, plugins). What
+        # chaiNNer-C lists itself stays: the server's packages (run.py has imported
+        # their list), the other packages'.
+        from dependencies.install_server_deps import deps as server_deps
+
+        listed = {
+            distribution_name(d.pypi_name)
+            for p in packages
+            if p.id not in package_ids_to_install
+            for d in p.dependencies
+        }
+        try:
+            deps.extend(
+                await asyncio.to_thread(
+                    unneeded_dependencies,
+                    deps,
+                    listed | {d.distribution for d in server_deps},
+                )
+            )
+        except ValueError as error:
+            logger.warning(f"Uninstalling only the listed dependencies: {error}")
 
         if len(deps) > 0:
             await change_dependencies(
@@ -349,9 +437,16 @@ async def install_dependencies_request(request: Request):
             deps.extend(deps_to_dep_info(p.dependencies))
 
         if len(deps) > 0:
-            await change_dependencies(
-                worker, install_dependencies(deps, progress, logger)
-            )
+
+            async def install() -> None:
+                await install_dependencies(deps, progress, logger)
+                # The VapourSynth user modules that are missing (all of them after
+                # VapourSynth's first install) go in while the worker is stopped.
+                await install_user_modules(
+                    missing_user_modules(ctx.config.storage_dir), progress
+                )
+
+            await change_dependencies(worker, install())
         return json({"status": "ok"})
     except Exception as ex:
         logger.error(f"Error installing dependencies: {ex}", exc_info=True)
@@ -456,6 +551,9 @@ async def import_packages(
 
     try:
         deps_to_install = filter_necessary_to_install(deps_to_dep_info(to_install))
+        # The worker scans the VapourSynth user modules when its nodes load; pip
+        # installs the missing ones here, at each start while one is missing.
+        user_modules = missing_user_modules(config.storage_dir)
 
         restart_flags: list[str] = []
         if config.error_on_failed_node:
@@ -463,14 +561,18 @@ async def import_packages(
         if config.close_after_start:
             restart_flags.append("--close-after-start")
 
-        if len(restart_flags) > 0 or len(deps_to_install) > 0:
+        if len(restart_flags) > 0 or len(deps_to_install) > 0 or user_modules:
             await worker.stop()
             try:
                 await install_dependencies(deps_to_install, update_progress_cb, logger)
             finally:
                 # Also after a failed install, as the dependency manager's routes do:
-                # a stopped worker would fail every route until the next start.
-                await worker.start(restart_flags)
+                # a stopped worker would fail every route until the next start. Each
+                # user module logs its own failure.
+                try:
+                    await install_user_modules(user_modules, update_progress_cb)
+                finally:
+                    await worker.start(restart_flags)
         else:
             logger.info("No dependencies to install. Skipping worker restart.")
     except Exception as ex:
@@ -557,6 +659,16 @@ close_task = None
 async def close_server(sanic_app: Sanic):
     # now we can close the server
     logger.info("Closing server...")
+
+    if sys.platform == "linux":
+        # The app sends SIGTERM once it has the answer to the shutdown request, as
+        # insurance (on Windows it is TerminateProcess, which no handler sees). Sanic's
+        # handler for it stops the event loop again, which cuts short the shutdown
+        # coroutines Sanic still runs on that loop (RuntimeError: Event loop stopped
+        # before Future completed), and uvloop cannot remove that handler once the loop
+        # has stopped. The default action ends the process at once, as on Windows; the
+        # worker is stopped below, and it exits with its host in any case.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     try:
         if setup_task is not None:

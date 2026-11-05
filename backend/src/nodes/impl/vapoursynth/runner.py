@@ -1,6 +1,8 @@
 """Runs compiled VapourSynth scripts in child processes: clip info and frames in vspipe,
 previews in vsview. The worker never imports VapourSynth; a plugin crash or a script
-error costs only the child, and its traceback names the node whose statement failed."""
+error costs only the child, and its traceback names the node whose statement failed.
+vspipe ends with the worker, also a worker that is killed (owned_job.worker_child);
+vsview's window stays open after it."""
 
 from __future__ import annotations
 
@@ -9,8 +11,10 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -19,11 +23,13 @@ from pathlib import Path
 from typing import Callable, Generator, Iterator, TypeVar
 
 import numpy as np
+import psutil
 
 from api import NodeAttributedError, NodeContext
 
 from ..colour_info import high_definition, pixel_layout
 from ..native_framework_images import planes_to_interleaved
+from ..owned_job import worker_child
 from .colour_props import PROPS, vs_pix_fmt
 from .script import node_for_line
 
@@ -33,6 +39,15 @@ T = TypeVar("T")
 STDERR_TAIL_LINES = 20
 # How often a wait for vspipe checks for Stop.
 STOP_POLL_SECONDS = 0.05
+# How long a new vsview has to stay up before its window counts as opened.
+VIEWER_GRACE_SECONDS = 3
+# vsview's log beside its script, and how many of its last lines an error keeps.
+VIEWER_LOG = "vsview.log"
+VIEWER_LOG_LINES = 10
+# The pid and start time of the vsview opened for the script beside it.
+VIEWER_PID = "vsview.pid"
+# The environment variables with which vsview (Qt) finds a window system on Linux.
+DISPLAY_VARIABLES = ("DISPLAY", "WAYLAND_DISPLAY", "QT_QPA_PLATFORM")
 # The colour frame properties clip_props reads.
 COLOUR_PROPS = tuple(prop for prop, _ in PROPS.values())
 
@@ -108,12 +123,62 @@ def _venv_appdata() -> str | None:
     return str(appdata)
 
 
+def _libpython() -> Path:
+    """This Python's shared libpython, which vsscript loads to run a script."""
+    name = sysconfig.get_config_var("INSTSONAME")
+    folders = (
+        Path(sys.base_prefix) / "lib",
+        Path(sys.base_prefix) / "lib64",
+        Path(sysconfig.get_config_var("LIBDIR") or "."),
+    )
+    for folder in folders:
+        if name and (folder / name).is_file():
+            return folder / name
+    raise VSScriptError(
+        "VapourSynth needs a Python with a shared libpython, and this one has none."
+    )
+
+
+@cache
+def vsscript_config_home() -> str:
+    # On Linux vsscript reads $XDG_CONFIG_HOME/vapoursynth/vapoursynth.toml, whatever
+    # the Python: a line per libvsscript.so (by its real path) with the executable and
+    # the libpython to load and the executable's modification time, which must all be
+    # right. `vapoursynth config` writes the line, but cannot find the libpython of a
+    # Python whose sysconfig names the machine that built it, and takes the path of a
+    # library reached through a link as it is. So the line is written here, in a folder
+    # inside the runtime (nothing goes to the user's config), and kept current for a
+    # runtime that was moved or whose Python was replaced.
+    library = os.path.realpath(vspipe().parent / "libvsscript.so")
+    key = library.replace("/lib64/", "/lib/")
+    mtime = int(os.stat(sys.executable).st_mtime)
+    values = [sys.executable, str(_libpython()), str(mtime)]
+    quoted = [json.dumps(text, ensure_ascii=False) for text in (key, *values)]
+    line = f"{quoted[0]} = [{','.join(quoted[1:])}]\n"
+    home = Path(sys.prefix) / "vsconfig"
+    config = home / "vapoursynth" / "vapoursynth.toml"
+    if not config.is_file() or config.read_text(encoding="utf-8") != line:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        handle, name = tempfile.mkstemp(dir=config.parent, suffix=".tmp")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as file:
+                file.write(line)
+            os.replace(name, config)
+        except BaseException:
+            Path(name).unlink(missing_ok=True)
+            raise
+    return str(home)
+
+
 def vs_env() -> dict[str, str]:
     """The environment of every VapourSynth child process."""
     env = _inherited_env()
-    appdata = _venv_appdata()
-    if appdata is not None:
-        env["APPDATA"] = appdata
+    if sys.platform.startswith("linux"):
+        env["XDG_CONFIG_HOME"] = vsscript_config_home()
+    else:
+        appdata = _venv_appdata()
+        if appdata is not None:
+            env["APPDATA"] = appdata
     return env
 
 
@@ -137,6 +202,14 @@ def script_error(
             if node_id is not None:
                 break
     message = "\n".join(lines[-STDERR_TAIL_LINES:]).strip()
+    if not message and returncode and returncode < 0:
+        # POSIX: a child that a signal ended has the signal's number, negated, as code.
+        signal_name = signal.strsignal(-returncode) or "unknown signal"
+        return VSScriptError(
+            f"vspipe was ended by signal {-returncode} ({signal_name}) and left no"
+            " message (a plugin crashed).",
+            node_id,
+        )
     if not message and returncode:
         # Windows' crash codes read as hex: 0xC0000005 is an access violation.
         code = (
@@ -153,7 +226,7 @@ def _run_vspipe(script: Path, args: list[str], context: NodeContext | None) -> s
     # evaluation can index a long video for minutes; the host restarts a worker that
     # does not stop within seconds).
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        with subprocess.Popen(
+        with worker_child(
             [str(vspipe()), *args],
             env=vs_env(),
             stdin=subprocess.DEVNULL,
@@ -333,7 +406,7 @@ def _vspipe_frames(
     buffer: np.ndarray | None = None
     count = 0
     with tempfile.TemporaryFile() as stderr:
-        with subprocess.Popen(
+        with worker_child(
             [*command, str(script), "-"],
             env=vs_env(),
             stdin=subprocess.DEVNULL,
@@ -548,24 +621,71 @@ def _open_viewer(script: Path) -> subprocess.Popen[bytes]:
             "vsview is not installed. Install the vsview package in the dependency"
             " manager."
         )
+    on_linux = sys.platform.startswith("linux")
+    # A QT_QPA_PLATFORM names the platform (offscreen, say) whatever the display.
+    if on_linux and not any(os.environ.get(name) for name in DISPLAY_VARIABLES):
+        raise VSScriptError(
+            "vsview needs a graphical session: neither DISPLAY nor WAYLAND_DISPLAY is"
+            " set."
+        )
     # vsview's output goes to a log beside the script.
-    with open(script.parent / "vsview.log", "wb") as log:
-        return subprocess.Popen(
+    log_path = script.parent / VIEWER_LOG
+    with open(log_path, "wb") as log:
+        viewer = subprocess.Popen(
             [str(vs_python()), "-m", "vsview", str(script)],
             cwd=script.parent,
-            env=vs_env(),
+            # It runs the script in its own process, which needs no vsscript
+            # configuration: on Linux its Qt and its settings keep the user's config
+            # folder.
+            env=_inherited_env() if on_linux else vs_env(),
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
             creationflags=_NO_WINDOW | _NEW_GROUP,
             start_new_session=True,
         )
+    # A vsview that cannot start ends within a second or two: Qt without a window (on
+    # Linux no X11 or Wayland connection, libxcb-cursor0 missing), a failed import.
+    try:
+        returncode = viewer.wait(VIEWER_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        # Not reaped yet, so the pid still names it.
+        started = psutil.Process(viewer.pid).create_time()
+        (script.parent / VIEWER_PID).write_text(
+            f"{viewer.pid} {started!r}", encoding="utf-8"
+        )
+        return viewer
+    log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    hint = (
+        " On Linux Qt needs a graphical session and libxcb-cursor0." if on_linux else ""
+    )
+    raise VSScriptError(
+        f"vsview ended right after it started (code {returncode}).{hint} The end of"
+        f" its log, {log_path}:\n" + "\n".join(log_lines[-VIEWER_LOG_LINES:]).strip()
+    )
+
+
+def _earlier_viewer(script: Path) -> bool:
+    """Whether the vsview of `script` that an earlier worker opened still runs (vsview
+    outlives a worker restart and chaiNNer-C itself). VIEWER_PID beside the script names
+    it by pid and start time, so a process that took the pid later does not count. On
+    Linux the start time moves with the clock (a step, a resume): a second's slack."""
+    try:
+        pid, started = (script.parent / VIEWER_PID).read_text(encoding="utf-8").split()
+        return abs(psutil.Process(int(pid)).create_time() - float(started)) < 1
+    except (OSError, ValueError, psutil.Error):
+        # No such file, or no such process: the window was closed.
+        return False
 
 
 def launch_preview(script: Path, key: str) -> None:
     """Shows `script` in vsview, one window per key: while the key's window is open, it
-    stays (the user reloads the rewritten script there); once closed, a new one opens."""
+    stays (the user reloads the rewritten script there), also one that an earlier
+    worker opened; once closed, a new one opens."""
     with _viewers_lock:
         viewer = _viewers.get(key)
-        if viewer is None or viewer.poll() is not None:
-            _viewers[key] = _open_viewer(script)
+        if viewer is not None and viewer.poll() is None:
+            return
+        if viewer is None and _earlier_viewer(script):
+            return
+        _viewers[key] = _open_viewer(script)

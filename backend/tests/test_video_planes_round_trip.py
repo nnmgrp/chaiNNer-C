@@ -4,7 +4,6 @@ chroma siting is honoured on load, on save and by the siting correction, and 8-b
 
 from __future__ import annotations
 
-import _winapi
 import json
 import os
 import subprocess
@@ -15,6 +14,7 @@ from typing import Any, cast
 
 import numpy as np
 import pytest
+from scratch_storage import NO_FFMPEG, STORAGE
 
 # The node's modules load the native backend, which GitHub's checks do not build.
 pytest.importorskip("nodes.impl._chainner_graph")
@@ -52,15 +52,12 @@ from packages.chaiNNer_standard.image.video_frames.save_video import (
     save_video_node,
 )
 
-STORAGE = Path(os.environ.get("APPDATA", "")) / "chaiNNer" / "backend-storage"
 FFMPEG, FFPROBE = map(str, get_executable_path(STORAGE / "ffmpeg"))
 # The local gates' FFmpeg (native/tools/bench_oracle.py), a newer FFmpeg than the
 # integrated one.
 NEWER_FFMPEG = Path(r"C:\Executables\ffmpeg-8.1-full_build-shared\bin\ffmpeg.exe")
 
-pytestmark = pytest.mark.skipif(
-    not Path(FFMPEG).exists(), reason="the integrated FFmpeg is not downloaded"
-)
+pytestmark = pytest.mark.skipif(not Path(FFMPEG).exists(), reason=NO_FFMPEG)
 AUTO = (Matrix.AUTO, Transfer.AUTO, Primaries.AUTO, Range.AUTO, ChromaLocation.AUTO)
 SWS_FLAGS = "lanczos+accurate_rnd+full_chroma_int+full_chroma_inp+bitexact"
 
@@ -212,6 +209,8 @@ def newer_ffmpeg_storage(tmp_path: Path):
         pytest.skip("the local gates' FFmpeg is not installed")
     storage = tmp_path / "storage"
     storage.mkdir()
+    import _winapi
+
     _winapi.CreateJunction(str(NEWER_FFMPEG.parent), str(storage / "ffmpeg"))
     yield storage
     os.rmdir(storage / "ffmpeg")

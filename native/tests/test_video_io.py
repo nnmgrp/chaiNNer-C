@@ -10,6 +10,7 @@ Save Video's audio mux compares with INTENDED_MUX instead of the installed night
 from __future__ import annotations
 
 import ast
+import collections
 import copy
 import errno
 import gc
@@ -29,7 +30,7 @@ import types
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 
 import ffmpeg
@@ -49,6 +50,8 @@ REFERENCE = Path(__file__).with_name("reference_video")
 NODE = "packages/chaiNNer_standard/image/video_frames/"
 API = runpy.run_path(str(REFERENCE / "installed/api/iter.py"))
 MODULES = []
+# video.py's module state for the frame-index scans, which load() keeps with the definitions.
+SCAN_STATE = ("_SCANS", "_SCANS_LOCK", "_SCANS_KEPT", "_PACKETS_PER_CHECK")
 
 
 def snap(value):
@@ -980,6 +983,9 @@ def load(kind, component, env=None):
         g["file_identity"] = file_identity
         g["planes_to_interleaved"] = planes_to_interleaved
         g["replace"] = replace
+        g["OrderedDict"] = collections.OrderedDict
+        g["Lock"] = threading.Lock
+        g["ModuleType"] = types.ModuleType
         g["resolve_colour_info"] = resolve_colour_info
         # Load Video's generator carries its frame range (with_range), which the
         # installed api lacks.
@@ -1012,7 +1018,12 @@ def load(kind, component, env=None):
         elif (
             isinstance(item, ast.AnnAssign)
             and isinstance(item.target, ast.Name)
-            and item.target.id == "PARAMETERS"
+            and item.target.id in ("PARAMETERS", *SCAN_STATE)
+        ) or (
+            isinstance(item, ast.Assign)
+            and len(item.targets) == 1
+            and isinstance(item.targets[0], ast.Name)
+            and item.targets[0].id in SCAN_STATE
         ):
             body.append(item)
     exec(
@@ -1144,7 +1155,9 @@ REPLACED = {
 def test_reference_hashes_and_registration_contracts():
     for entry in json.loads((REFERENCE / "manifest.json").read_text())["files"]:
         assert (
-            hashlib.sha256((REFERENCE / entry["snapshot"]).read_bytes()).hexdigest()
+            hashlib.sha256(
+                (REFERENCE / PureWindowsPath(entry["snapshot"]).as_posix()).read_bytes()
+            ).hexdigest()
             == entry["sha256"]
         )
     # Old chains keep working: the installed registration with inputs and outputs
@@ -3316,7 +3329,21 @@ def test_writer_abnormal_wait_falls_back_to_termination_and_joins(terminate_fail
     assert env.events == expected
 
 
-@pytest.mark.parametrize("denied", ["none", "terminate", "both"])
+@pytest.mark.parametrize(
+    "denied",
+    [
+        "none",
+        "terminate",
+        pytest.param(
+            "both",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32",
+                reason="with both stops refused, Windows joins the close through "
+                "CancelSynchronousIo, which POSIX has no counterpart of",
+            ),
+        ),
+    ],
+)
 def test_real_stalled_pipe_close_is_joined_even_when_termination_errors(
     denied, monkeypatch
 ):
@@ -3328,11 +3355,16 @@ def test_real_stalled_pipe_close_is_joined_even_when_termination_errors(
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
     original_kill = p.kill
     original_pipe = p.stdin
     assert original_pipe is not None
+    if sys.platform == "linux":
+        import fcntl
+
+        # A Windows anonymous pipe's 4 KiB: Linux's 64 KiB would take the flush whole
+        fcntl.fcntl(original_pipe.fileno(), fcntl.F_SETPIPE_SZ, 4096)
     finished = threading.Event()
     entered = threading.Event()
 
@@ -3401,6 +3433,11 @@ def test_finalization_cleanup_avoids_creating_gil_acquiring_worker(monkeypatch):
     assert w.out.returncode is not None
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="the close cancels a stalled write with CancelSynchronousIo on Windows; "
+    "elsewhere ending the reader breaks the pipe",
+)
 def test_stalled_pipe_cancellation_covers_io_start_after_first_cancel(monkeypatch):
     # Hold the close before its real OS write until both public stop calls fail.
     # The initial cancellation then finds no pending synchronous I/O. A fixture
@@ -3411,7 +3448,7 @@ def test_stalled_pipe_cancellation_covers_io_start_after_first_cancel(monkeypatc
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
     original_kill, original_wait, original_pipe = p.kill, p.wait, p.stdin
     assert original_pipe is not None

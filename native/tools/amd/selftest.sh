@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# The kit's self-test on a machine without an AMD GPU, in Docker containers of a bare image (native/AMD.md, Updating
+# the kit): the host check must stop with exit status 2; a dry run must finish; and with --zip the kit's real steps run
+# twice, VOSR skipped, 2 timed calls. First on the CPU (KIT_SELFTEST=1 lets the host check go on): setup through the
+# dependency manager, which installs a CPU build of PyTorch, the tests, the chains, the spandrel checks, the speed
+# table and the uninstall check. The PyTorch and NCNN chains must pass there (this run is chaiNNer-C's only check of a
+# CPU build of PyTorch; the test suite runs a CUDA build with CUDA hidden), and the spandrel checks must pass with their
+# code run on the CPU (the architecture check on three architectures). Then beside a fake AMD GPU (fake_gpu.sh, the
+# --gpu profile; the container gets SYS_ADMIN for it, the kit runs without): all a real AMD machine runs but the GPU's
+# own work. The host check must pass, the dependency manager must install ROCm's builds with that GPU's kernels alone,
+# MIGraphX's nodes must load, ONNX Runtime must offer MIGraphX first, ROCm's tools must start, the PyTorch and NCNN
+# chains must pass on the CPU, and the spandrel checks must pass, finding no GPU for PyTorch. The checkout is copied
+# without its build outputs; results go to $KIT_SELFTEST_DIR (default
+# ~/amd-kit-selftest).
+# Usage: native/tools/amd/selftest.sh [--zip FILE] [--image ubuntu:24.04] [--gpu gfx1100|gfx942]
+set -uo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+dir=${KIT_SELFTEST_DIR:-$HOME/amd-kit-selftest}
+zip=""
+image=ubuntu:24.04
+gpu=gfx1100
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --zip) zip=${2:?--zip needs a file}; shift ;;
+        --image) image=${2:?--image needs a Docker image}; shift ;;
+        --gpu) gpu=${2:?--gpu needs gfx1100 or gfx942}; shift ;;
+        *) echo "error: unknown argument $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+command -v docker >/dev/null 2>&1 || { echo "error: the self-test needs Docker" >&2; exit 1; }
+[ -z "$zip" ] || [ -f "$zip" ] || { echo "error: no zip at $zip" >&2; exit 1; }
+
+rm -rf -- "$dir"
+mkdir -p "$dir/checkout" "$dir/z" "$dir/results"
+tar -C "$repo" --exclude=./.git --exclude=./node_modules --exclude=./out --exclude=./native/build \
+    --exclude=./native/runtime --exclude=./native/.venv --exclude=./native/local -cf - . | tar -C "$dir/checkout" -xf -
+[ -z "$zip" ] || cp "$zip" "$dir/z/app.zip"
+cat >"$dir/in_container.sh" <<'EOF'
+set -u
+cp -r /kit /root/chaiNNer-C
+kit=/root/chaiNNer-C/native/tools/amd
+case $1 in
+    stop) bash $kit/kit.sh --zip /z/app.zip ;;
+    dry) bash $kit/kit.sh --dry-run ;;
+    cpu)
+        # PyTorch in FP16 on a CPU takes many minutes per image: the CPU's routes are FP32 and NCNN. The architecture
+        # check runs three architectures: one from its defaults, one from the check's own settings, one with two networks.
+        KIT_SELFTEST=1 KIT_SKIP_VOSR=1 KIT_ONLY='^esrgan-(pytorch-fp32|ncnn-vulkan)$' \
+            KIT_ARCHS='^(Compact|SPAN|DRFT)$' bash $kit/kit.sh --zip /z/app.zip --iterations 2
+        ;;
+    fake)
+        bash $kit/fake_gpu.sh --container "$2" || exit 1
+        KIT_SKIP_VOSR=1 KIT_ONLY='^esrgan-(pytorch-fp32|ncnn-vulkan)$' setpriv --bounding-set -sys_admin \
+            --inh-caps -sys_admin -- bash $kit/kit.sh --zip /z/app.zip --iterations 2
+        ;;
+esac
+status=$?
+cp /root/amd-kit/out/summary.md "/results/summary-$1.md"
+cp /root/amd-kit/amd-kit-report-*.tar.gz "/results/report-$1.tar.gz"
+exit $status
+EOF
+
+failed=0
+check() {
+    if [ "$2" = 0 ]; then
+        echo "PASS $1"
+    else
+        echo "FAIL $1"
+        failed=1
+    fi
+}
+# container MODE [DOCKER_ARGUMENT...]
+container() {
+    local mode=$1
+    shift
+    timeout 3600 docker run --rm --name "amd-kit-selftest-$mode" -v "$dir/checkout:/kit:ro" -v "$dir/z:/z:ro" \
+        -v "$dir/results:/results" -v "$dir/in_container.sh:/in_container.sh:ro" "$@" --entrypoint bash "$image" \
+        /in_container.sh "$mode" "$gpu" >"$dir/results/$mode.log" 2>&1
+}
+
+container stop
+status=$?
+check "the host check stops without an AMD GPU (exit $status, expected 2)" "$([ "$status" = 2 ]; echo $?)"
+container dry
+check "a dry run finishes (exit $?)" "$?"
+# Both spandrel checks pass: on the CPU against itself in the CPU's run, as not run (no AMD GPU for PyTorch) beside
+# the fake GPU. spandrel_steps SUMMARY
+spandrel_steps() {
+    grep -qE '^- every architecture: exit 0,' "$1" 2>/dev/null
+    check "the architecture check passes ($2)" "$?"
+    grep -qE '^- HIP kernels on and off: exit 0,' "$1" 2>/dev/null
+    check "the HIP kernels check passes ($2)" "$?"
+}
+if [ -n "$zip" ]; then
+    container cpu
+    summary=$dir/results/summary-cpu.md
+    for chain in esrgan-pytorch-fp32 esrgan-ncnn-vulkan; do
+        grep -q "^| $chain | esrgan | passed |" "$summary" 2>/dev/null
+        check "the chain $chain passes on the CPU" "$?"
+    done
+    grep -q '^| PyTorch | enabled |' "$summary" 2>/dev/null
+    check "the PyTorch package is enabled with a CPU build of PyTorch" "$?"
+    spandrel_steps "$summary" "on the CPU"
+    for row in '^\| Compact \| defaults; .* \| FP32 \| ok \|' '^\| SPAN \| num_in_ch=3, .* \| FP32 \| ok \|' \
+        '^\| DRFT \(legacy\) \| .* \| FP32 \| ok \|'; do
+        grep -qE "$row" "$summary" 2>/dev/null
+        check "the architecture check's row $row" "$?"
+    done
+
+    container fake --cap-add SYS_ADMIN
+    summary=$dir/results/summary-fake.md
+    grep -q '^Host check: passed' "$summary" 2>/dev/null
+    check "the host check passes with a fake $gpu" "$?"
+    grep -qE '^- torch [0-9.]+\+rocm[0-9.]+, HIP [0-9]' "$summary" 2>/dev/null
+    check "the dependency manager installs PyTorch's ROCm build" "$?"
+    grep -qx -- "- Kernel wheels installed: $gpu" "$summary" 2>/dev/null
+    check "ROCm's GPU kernels are those of $gpu alone" "$?"
+    grep -qE '^\| MIGraphX \| enabled \| [1-9][0-9]* \|' "$summary" 2>/dev/null
+    check "the MIGraphX package is enabled and its nodes load" "$?"
+    grep -qE '^- onnxruntime [0-9.]+: MIGraphXExecutionProvider,' "$summary" 2>/dev/null
+    check "ONNX Runtime offers MIGraphX first" "$?"
+    tools=$(sed -n '/^### ROCm/,/^### Vulkan/p' "$summary" 2>/dev/null)
+    [ -n "$tools" ] && ! grep -q 'No such file or directory' <<<"$tools"
+    check "ROCm's tools start" "$?"
+    for chain in esrgan-pytorch-fp32 esrgan-ncnn-vulkan; do
+        grep -q "^| $chain | esrgan | passed |" "$summary" 2>/dev/null
+        check "the chain $chain passes on the CPU beside the fake $gpu" "$?"
+    done
+    spandrel_steps "$summary" "beside the fake $gpu"
+fi
+echo "results: $dir/results"
+exit "$failed"

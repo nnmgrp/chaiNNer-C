@@ -117,6 +117,8 @@ def test_run_proxies_without_recycling_the_worker():
         upstream.index("from gpu import nvidia") + 1,
         "from nodes.impl.cors import add_cors",
     )
+    # The VRAM line shows AMD GPUs on a machine without an NVIDIA GPU (test_amd_gpu.py).
+    upstream[upstream.index("from gpu import nvidia")] = "from gpu import amd, nvidia"
     upstream[upstream.index("from server_config import ServerConfig")] = (
         "from server_config import LOG_CONFIG, ServerConfig"
     )
@@ -136,7 +138,9 @@ def test_run_proxies_without_recycling_the_worker():
         "from typing import Any, Coroutine, Final"
     )
     # VapourSynth: a dependency installed with [extras] (vsjetpack[deinterlace]) is
-    # looked up by the name pip lists it under.
+    # looked up by the name pip lists it under. An installed build a dependency
+    # replaces (PyTorch's ROCm build where NVIDIA's is listed) is not that dependency.
+    # An uninstall also takes what pip pulled in that nothing else needs.
     upstream[
         upstream.index(
             "from dependencies.store import DependencyInfo, filter_necessary_to_install, "
@@ -145,14 +149,23 @@ def test_run_proxies_without_recycling_the_worker():
     ] = (
         "from dependencies.store import DependencyInfo, distribution_name, "
         "filter_necessary_to_install, install_dependencies, installed_packages, "
-        "uninstall_dependencies"
+        "replaced, uninstall_dependencies, unneeded_dependencies"
     )
     # Instant startup: main takes the worker run.py started (a subprocess.Popen), and
     # the setup events go to every listener (BackendEventBroadcast, no setup queue).
     upstream.insert(upstream.index("import sys"), "import subprocess")
+    # Linux: close_server gives SIGTERM its default action back (test_host_shutdown.py).
+    upstream.insert(upstream.index("import subprocess"), "import signal")
     upstream.remove("from functools import cached_property")
     upstream[upstream.index("from events import EventQueue")] = (
         "from events import BackendEventBroadcast"
+    )
+    # VapourSynth: the host installs the user modules user_modules.toml lists at a
+    # start and after a dependency install (test_startup_install.py).
+    upstream.insert(
+        upstream.index("from nodes.impl.cors import add_cors") + 1,
+        "from nodes.impl.vapoursynth.user_modules import install_user_modules, "
+        "missing_user_modules",
     )
     assert imports[0] == upstream
     # No stop/start-around-run path: the host defines upstream's functions only.
@@ -172,6 +185,11 @@ def test_run_proxies_without_recycling_the_worker():
     # Instant startup: the host tells the app which nodes the worker has registered
     # while it loads them, so previews never wait in the worker for their framework.
     functions[0].remove("announce_registered_nodes")
+    # An uninstall keeps a dependency another installed package also lists (ROCm's
+    # wheels, which the PyTorch and ONNX packages share on AMD GPUs).
+    functions[0].remove("shared_distributions")
+    # /installed-dependencies leaves out an installed build a dependency replaces.
+    functions[0].remove("installed_versions")
     assert functions[0] == functions[1]
 
 
@@ -229,6 +247,17 @@ def test_host_and_worker_close_as_upstream():
                 stop,
                 "\n    while not sanic_app.state.is_running:"
                 "\n        await asyncio.sleep(0.01)" + stop,
+            )
+            # Linux: the host's SIGTERM takes its default action from here on, so the
+            # app's SIGTERM after the shutdown answer ends it at once, as Windows'
+            # TerminateProcess does, instead of cutting Sanic's shutdown short.
+            closing = "\n    logger.info('Closing server...')"
+            upstream = replace_once(
+                upstream,
+                closing,
+                closing
+                + "\n    if sys.platform == 'linux':"
+                "\n        signal.signal(signal.SIGTERM, signal.SIG_DFL)",
             )
         assert here == upstream, path
 

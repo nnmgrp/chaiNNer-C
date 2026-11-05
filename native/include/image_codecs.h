@@ -63,6 +63,11 @@ cn_codec_status cn_jpeg_decode(const uint8_t *data, size_t size, cn_jpeg_flavour
  * 16-bit, native-endian) and its transforms. An animated PNG falls back. */
 cn_codec_status cn_png_decode(const uint8_t *data, size_t size, cn_codec_allocate allocate, void *context);
 
+/* Inflates one zlib stream of size bytes to exactly out_size bytes on many threads (png_inflate.c). Returns 1 where
+ * libdeflate_zlib_decompress_ex would succeed with the same bytes and use the whole stream; 0 otherwise, whether or not
+ * it would, with out's contents undefined. */
+int cn_png_inflate_parallel(const uint8_t *stream, size_t size, uint8_t *out, size_t out_size);
+
 /* Decodes a WebP with libwebp 1.6.0 as OpenCV 5.0's WebPDecoder does under IMREAD_UNCHANGED: the features of the
  * first 32 bytes decide BGR or BGRA; a still image through WebPDecodeBGRInto/WebPDecodeBGRAInto, an animation
  * through WebPAnimDecoder (MODE_BGRA, first canvas, alpha dropped for BGR). */
@@ -92,7 +97,8 @@ cn_codec_status cn_tiff_decode(const uint8_t *data, size_t size, cn_codec_alloca
 /* Decodes what Load Image's straight-alpha TIFF decoder (load_image.py's _read_tiff_straight_alpha, Pillow 12.3)
  * gives for its plainest files: 8-bit RGBA or grey+alpha with ExtraSamples (2,) in contiguous strips, uncompressed
  * (Pillow's raw decoder) or LZW, Deflate or PackBits (libtiff), as BGRA with the grey copied to B, G and R, before
- * the orientation turn; *orientation is set to the Orientation tag, or without one to the XMP packet's
+ * the orientation turn; and, alike through libtiff, 16-bit grey+alpha with ExtraSamples (1,) or (2,), which Pillow
+ * cannot open, as uint16 BGRA with its samples as stored; *orientation is set to the Orientation tag, or without one to the XMP packet's
  * tiff:Orientation as Pillow's getexif() reads it (1 outside 2-8), before `allocate` is called. Any other tag, type,
  * count or value, and anything Pillow would warn about (an Exif IFD it reads with a warning too), falls back to the
  * Python decoder. */

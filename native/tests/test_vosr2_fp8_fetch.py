@@ -7,9 +7,11 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import os
 import random
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from compression import zstd
 from dataclasses import dataclass, field
@@ -165,6 +167,22 @@ def host(monkeypatch, tmp_path) -> Iterator[Host]:
         thread.join()
 
 
+@pytest.fixture(params=["as_is", "reused"])
+def identities(request, monkeypatch) -> None:
+    """The file system as it is, or as ext4 can be: it hands a deleted file's inode to
+    the next file at once and stamps files with coarse times, so only a file's size tells
+    it from the file it replaces."""
+    if request.param == "reused":
+
+        def identity(path: Path) -> tuple:
+            try:
+                return (str(path.absolute()), path.stat().st_size)
+            except FileNotFoundError:
+                return (str(path.absolute()), None)
+
+        monkeypatch.setattr(vosr2_engine_cache, "file_identity", identity)
+
+
 def context_for(tmp_path: Path, progress: list[float], abort_after: int = -1):
     calls = [0]
 
@@ -234,6 +252,7 @@ def test_a_broken_download_resumes_or_restarts_by_server_support(
     assert progress[-1] == pytest.approx(1.0)
 
 
+@pytest.mark.usefixtures("identities")
 def test_a_hash_mismatch_is_deleted_and_reported(host, tmp_path):
     host.corrupt.add("dino.onnx.data.zst")
     with pytest.raises(
@@ -360,9 +379,23 @@ def test_engines_are_built_once_and_keyed_by_what_determines_them(
     requests = len(host.log)
     assert vosr2_fp8.ensure_fp8_engine(context, bundle, device) == path
     assert len(builds) == 1 and len(host.log) == requests
+    # Another GPU's set of the next version: it stays when that version replaces this one.
+    other_gpu = {**identity, "plugin_sha256": "b", "gpu": "Other GPU"}
+    other = path.parent / vosr2_engine_cache.identity_key(other_gpu)
+    other.mkdir()
+    (other / "manifest.json").write_text(json.dumps({"identity": other_gpu}))
     identity["plugin_sha256"] = "b"
-    assert vosr2_fp8.ensure_fp8_engine(context, bundle, device) != path
+    current = vosr2_fp8.ensure_fp8_engine(context, bundle, device)
+    assert current != path
     assert len(builds) == 2 and len(host.log) == requests
+    # The replaced set stays until it has gone unused for two weeks
+    assert path.is_dir()
+    when = time.time() - 15 * 86400
+    for file in [*path.rglob("*"), path]:
+        os.utime(file, (when, when))
+    assert vosr2_fp8.ensure_fp8_engine(context, bundle, device) == current
+    assert len(builds) == 2
+    assert not path.exists() and current.is_dir() and other.is_dir()
     capability[:] = [8, 6]
     with pytest.raises(ValueError, match="FP8 support"):
         vosr2_fp8.ensure_fp8_engine(context, bundle, device)
@@ -472,6 +505,7 @@ def test_a_broken_model_download_resumes(model_host, tmp_path):
     assert ("ema_model.safetensors", f"bytes={partial}-") in model_host.log
 
 
+@pytest.mark.usefixtures("identities")
 def test_a_model_file_that_does_not_match_its_pin_is_deleted(model_host, tmp_path):
     model_host.corrupt.add("dinov2_vitl14_pretrain.pth")
     with pytest.raises(

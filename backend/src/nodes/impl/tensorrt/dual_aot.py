@@ -4,7 +4,8 @@ neither a C++ compiler nor the CUDA Toolkit is needed. Core's and Project's kern
 the C++ plugins' own (vendor/dual_tensorrt/scripts/dual_tensorrt/kernels.py, compiled
 with aot.py's options); Norm and the attention barrier get Triton versions of their CUDA
 code. An AOT plugin launches one kernel, so Core's three become three plugins whose
-statistics and attention matrices are tensors.
+statistics and attention matrices are tensors. Neighborhood attention (DualNA, which has
+no C++ plugin) launches dual_na_kernel.py's kernel, compiled with its own options.
 
 The exported ONNX keeps the guide's C++ plugin nodes. TensorRT 11.2's ONNX parser mixes
 up Python plugin instances (a layer calls another plugin's functions), so `lower`
@@ -36,7 +37,7 @@ from onnx import TensorProto, helper, numpy_helper
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-from . import dual_dynamic_kernels
+from . import dual_dynamic_kernels, dual_na_kernel
 
 KERNELS = (
     Path(__file__).resolve().parents[3]
@@ -49,10 +50,15 @@ Launch = Tuple[
 ]
 # aot.py's compile options for the RCA and projection kernels
 OPTIONS = {"num_warps": 4, "num_stages": 1, "enable_fp_fusion": False}
-APPLY_BT = 256
+# Split the value application over four programs per cell; each output keeps the
+# same four-region accumulation order. Shared by fixed and dynamic engines.
+APPLY_BT = 64
 PROJECT_BM = 64
 NORM_PIXELS = 16
 COPY_BLOCK = 1024
+# The shared memory TensorRT's AOT plugin path launches with (a 57344-byte NA candidate
+# failed there)
+MAX_SHARED = 49152
 
 
 @triton.jit
@@ -96,6 +102,49 @@ def copy_kernel(
     tl.store(y_ptr + offsets, tl.load(x_ptr + offsets, mask), mask)
 
 
+@triton.jit
+def router_add_kernel(
+    a_ptr: tl.tensor,
+    b_ptr: tl.tensor,
+    count: tl.int32,
+    out_ptr: tl.tensor,
+    block: tl.constexpr,
+) -> None:
+    """Coalesced residual addition with the original BF16 rounding boundary."""
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    mask = offsets < count
+    a = tl.load(a_ptr + offsets, mask, 0).to(tl.float32)
+    b = tl.load(b_ptr + offsets, mask, 0).to(tl.float32)
+    tl.store(out_ptr + offsets, (a + b).to(tl.bfloat16), mask)
+
+
+@cache
+def _register_router_add(sm: int) -> None:
+    @trtp.register(f"{NAMESPACE}::router_add")
+    @_resolved
+    def router_add_shape(a: trtp.TensorDesc, b: trtp.TensorDesc) -> trtp.TensorDesc:
+        return a.like()
+
+    @trtp.aot_impl(f"{NAMESPACE}::router_add")
+    @_resolved
+    def router_add_launch(
+        a: trtp.TensorDesc,
+        b: trtp.TensorDesc,
+        outputs: tuple[trtp.TensorDesc],
+        tactic: int,
+    ) -> Launch:
+        count = a.shape_expr.numel()
+        kernel = compile_kernel(
+            router_add_kernel,
+            {"a_ptr": "*bf16", "b_ptr": "*bf16", "count": "i32", "out_ptr": "*bf16"},
+            {"block": COPY_BLOCK},
+            sm,
+        )
+        return _launch(
+            kernel, (trtp.max(trtp.cdiv(count, COPY_BLOCK), 1), 1, 1), [count]
+        )
+
+
 @cache
 def vendored_kernels() -> ModuleType:
     """The vendored Triton kernels (a standalone module)."""
@@ -118,7 +167,11 @@ def _resolved(function: F) -> F:
 
 
 def compile_kernel(
-    fn: Any, pointers: dict[str, str], constants: dict[str, Any], sm: int
+    fn: Any,
+    pointers: dict[str, str],
+    constants: dict[str, Any],
+    sm: int,
+    options: dict[str, Any] = OPTIONS,
 ):
     signature = {**pointers, **dict.fromkeys(constants, "constexpr")}
     # TensorRT's buffers are 16-byte aligned. A launch tells Triton's JIT so; an AOT
@@ -131,11 +184,38 @@ def compile_kernel(
     kernel = triton.compile(
         ASTSource(fn=fn, signature=signature, constexprs=constants, attrs=aligned),
         target=GPUTarget("cuda", sm, 32),
-        options=OPTIONS,
+        options=options,
     )
     metadata = kernel.metadata
     if metadata.global_scratch_size or metadata.profile_scratch_size:
         raise RuntimeError(f"{fn.__name__} needs Triton scratch memory")
+    return kernel
+
+
+@cache
+def na_kernel(channels: int, window: int, sm: int) -> Any:
+    """The neighborhood-attention kernel of a width and window, compiled once: static
+    and dynamic engines launch the same kernel (the trunk's height and width are
+    run-time arguments)."""
+    kernel = compile_kernel(
+        dual_na_kernel.na_attention,
+        {
+            "qkv_ptr": "*bf16",
+            "bq_ptr": "*bf16",
+            "bk_ptr": "*bf16",
+            "height": "i32",
+            "width": "i32",
+            "out_ptr": "*bf16",
+        },
+        {"channels": channels, "window": window, **dual_na_kernel.LAUNCH},
+        sm,
+        dual_na_kernel.OPTIONS,
+    )
+    if kernel.metadata.shared > MAX_SHARED:
+        raise RuntimeError(
+            f"The neighborhood-attention kernel needs {kernel.metadata.shared} bytes of"
+            f" shared memory; TensorRT's AOT plugins launch with at most {MAX_SHARED}"
+        )
     return kernel
 
 
@@ -225,6 +305,7 @@ def register(key: str) -> None:
     pixels = h * w
     sm = _sm()
     kernels = vendored_kernels()
+    _register_router_add(sm)
 
     def plugin(name: str) -> str:
         return f"{NAMESPACE}::{name}_{key}"
@@ -367,6 +448,30 @@ def register(key: str) -> None:
         )
         return _launch(kernel, ((pixels + PROJECT_BM - 1) // PROJECT_BM, 1, 1))
 
+    @trtp.register(plugin("na"))
+    @_resolved
+    def na_shape(
+        qkv: trtp.TensorDesc, bq: trtp.TensorDesc, bk: trtp.TensorDesc, window: int
+    ) -> trtp.TensorDesc:
+        s = qkv.shape_expr
+        return trtp.from_shape_expr((s[0], s[1], s[2], c), trt.bfloat16)
+
+    @trtp.aot_impl(plugin("na"))
+    @_resolved
+    def na_launch(
+        qkv: trtp.TensorDesc,
+        bq: trtp.TensorDesc,
+        bk: trtp.TensorDesc,
+        window: int,
+        outputs: tuple[trtp.TensorDesc],
+        tactic: int,
+    ) -> Launch:
+        return _launch(
+            na_kernel(c, window, sm),
+            dual_na_kernel.grid(h, w, c, triton.cdiv),
+            [h, w],
+        )
+
     _register_barrier(sm)
 
 
@@ -412,6 +517,7 @@ def register_dynamic(channels: int) -> None:
     once: sizes, grids and scalar arguments are shape expressions of the inputs."""
     heads = channels // 32
     sm = _sm()
+    _register_router_add(sm)
 
     def plugin(name: str) -> str:
         return f"{NAMESPACE}::{name}_c{channels}"
@@ -604,6 +710,31 @@ def register_dynamic(channels: int) -> None:
         )
         return _launch(kernel, (trtp.cdiv(pixels, PROJECT_BM), 1, 1), [pixels])
 
+    @trtp.register(plugin("na"))
+    @_resolved
+    def dynamic_na_shape(
+        qkv: trtp.TensorDesc, bq: trtp.TensorDesc, bk: trtp.TensorDesc, window: int
+    ) -> trtp.TensorDesc:
+        s = qkv.shape_expr
+        return trtp.from_shape_expr((s[0], s[1], s[2], channels), trt.bfloat16)
+
+    @trtp.aot_impl(plugin("na"))
+    @_resolved
+    def dynamic_na_launch(
+        qkv: trtp.TensorDesc,
+        bq: trtp.TensorDesc,
+        bk: trtp.TensorDesc,
+        window: int,
+        outputs: tuple[trtp.TensorDesc],
+        tactic: int,
+    ) -> Launch:
+        height, width, _, _ = _trunk(qkv)
+        return _launch(
+            na_kernel(channels, window, sm),
+            dual_na_kernel.grid(height, width, channels, trtp.cdiv),
+            [height, width],
+        )
+
     _register_dynamic_barrier(sm)
 
 
@@ -650,9 +781,84 @@ class Lowered:
     readers: dict[str, str]
 
 
+def _lower_router_additions(lowered: Lowered, channels: int) -> None:
+    """Materialize router residual sums without replacing native FP32 means.
+
+    Splitting this addition prevents an expensive strided Add/Transpose/Cast/Mean
+    fusion. Only provably same-shaped BF16 NHWC operands qualify; broadcasts and
+    unresolved shapes keep the native graph. No preset or output-scale gates.
+    """
+    graph = lowered.model.graph
+    inferred = onnx.shape_inference.infer_shapes(lowered.model)
+    shapes = {}
+    for value in [
+        *inferred.graph.value_info,
+        *inferred.graph.input,
+        *inferred.graph.output,
+    ]:
+        tensor = value.type.tensor_type
+        if tensor.elem_type != TensorProto.BFLOAT16:
+            continue
+        shape = tuple(
+            dim.dim_value if dim.HasField("dim_value") else dim.dim_param or None
+            for dim in tensor.shape.dim
+        )
+        if len(shape) == 4 and shape[-1] == channels and all(shape):
+            shapes[value.name] = shape
+    nodes = {output: node for node in graph.node for output in node.output}
+    constants = {
+        value.name: numpy_helper.to_array(value) for value in graph.initializer
+    }
+    seen: set[str] = set()
+    for node in list(graph.node):
+        if node.op_type != "ReduceMean" or len(node.input) != 2:
+            continue
+        axes = constants.get(node.input[1])
+        if axes is None or axes.tolist() != [2, 3]:
+            continue
+        cast = nodes.get(node.input[0])
+        if cast is None or cast.op_type != "Cast":
+            continue
+        if {a.name: helper.get_attribute_value(a) for a in cast.attribute}.get(
+            "to"
+        ) != TensorProto.FLOAT:
+            continue
+        transpose = nodes.get(cast.input[0])
+        if transpose is None or transpose.op_type != "Transpose":
+            continue
+        if {a.name: helper.get_attribute_value(a) for a in transpose.attribute}.get(
+            "perm"
+        ) != [0, 3, 1, 2]:
+            continue
+        addition = nodes.get(transpose.input[0])
+        if addition is None or addition.op_type != "Add" or len(addition.input) != 2:
+            continue
+        output = addition.output[0]
+        shape = shapes.get(addition.input[0])
+        if output in seen or shape is None or shapes.get(addition.input[1]) != shape:
+            continue
+        for index, source in enumerate(addition.input):
+            reader = f"{output}/router_add_reader_{index}"
+            graph.node.append(
+                helper.make_node("Identity", [source], [reader], name=reader)
+            )
+            lowered.readers[reader] = source
+        # Attach before direct plugin consumers so they also see the replacement;
+        # native consumers are rewired by attach's original network inventory.
+        position = next(
+            (i for i, plugin in enumerate(lowered.plugins) if output in plugin.inputs),
+            len(lowered.plugins),
+        )
+        lowered.plugins.insert(
+            position, Plugin("router_add", list(addition.input), [output])
+        )
+        seen.add(output)
+
+
 def lower(model: onnx.ModelProto, key: str) -> Lowered:
-    """The model with each of the guide's plugin nodes replaced by stand-in operators
-    of the same output shapes and types, and the plugins to attach in their place.
+    """The model with each of the exporter's plugin nodes (the guide's and DualNA)
+    replaced by stand-in operators of the same output shapes and types, and the
+    plugins to attach in their place.
     A width-only key (c<C>) is a dynamic-shape model: only plugins read the core's
     statistics and matrices, so their stand-ins are single elements."""
     dynamic = "_h" not in key
@@ -726,6 +932,20 @@ def lower(model: onnx.ModelProto, key: str) -> Lowered:
         elif op == f"DualProject_{key}_TRT":
             identity(inputs[2], outputs[0])
             plugins.append(Plugin(f"project_{key}", inputs, outputs))
+        elif op == f"DualNA_{key}_TRT":
+            # Inputs qkv, bq, bk; the output has qkv's first C channels' shape.
+            attributes = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+            starts = constant(f"{name}/starts", np.array([0], np.int64))
+            ends = constant(f"{name}/ends", np.array([channels], np.int64))
+            axes = constant(f"{name}/axes", np.array([3], np.int64))
+            nodes.append(
+                helper.make_node("Slice", [inputs[0], starts, ends, axes], outputs)
+            )
+            plugins.append(
+                Plugin(
+                    f"na_{key}", inputs, outputs, {"window": int(attributes["window"])}
+                )
+            )
         elif op == "DualAttentionBarrier_TRT":
             identity(inputs[0], outputs[0])
             barrier = "barrier_dynamic" if dynamic else "barrier"
@@ -749,7 +969,9 @@ def lower(model: onnx.ModelProto, key: str) -> Lowered:
     del lowered.graph.node[:]
     lowered.graph.node.extend(nodes)
     lowered.graph.initializer.extend(initializers)
-    return Lowered(lowered, plugins, readers)
+    result = Lowered(lowered, plugins, readers)
+    _lower_router_additions(result, channels)
+    return result
 
 
 def attach(network: trt.INetworkDefinition, lowered: Lowered) -> None:
@@ -804,6 +1026,7 @@ __all__ = [
     "attach",
     "compile_kernel",
     "lower",
+    "na_kernel",
     "register",
     "register_dynamic",
     "vendored_kernels",

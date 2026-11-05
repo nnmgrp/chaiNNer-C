@@ -4,6 +4,351 @@ Current state, pending work and the decision log. Commands: `README.md`. Design:
 
 ## State
 
+- 2026-11-05 **ESRGAN, HAT and DAT convert and build in FP16 with no precision choice**, not released. Convert To
+  ONNX hides Data Type and Calibration Image for them and exports FP16 whatever PyTorch's FP16 setting says; it records
+  the architecture in the ONNX (`chainner_c.architecture`), so a saved file stays seamless. Build Engine and Build
+  Program hide Precision for such files and ignore a value a saved chain still holds. Files without the record behave
+  as before. Against strict FP32 at 256x256, TF32 off: 15 ESRGAN weights 52.9 to 66.8 dB (8 crops), HAT-L 58.7 to 60.2,
+  DAT2 65.8 to 67.7 (55.2 to 59.8 on a Dynamic engine; 4 crops, one weight each); no NaN or Inf. Session ms, FP32 ->
+  FP16, RTX 5090: HAT-L 333.6 -> 69.9, DAT2 123.8 -> 43.1. Screentone models (4x eula) are not precision tests: they
+  draw dots on flat areas, so pixel PSNR collapses (24.5 dB) while tone holds (46.6 to 56.9 dB after a 16-pixel blur).
+- 2026-11-05 **ESRGAN FP16 exports nest their dense-block joins** (`esrgan_export.py`): `cat(cat(x, x1), x2)` instead
+  of `cat(x, x1, x2)`, same channels in the same order. TensorRT's concat kernels were 25 % of a plain 512x512 run and
+  are gone. Session ms before -> after, same session, one paired run, 50 iterations, median: 4x-UltraSharp 512x512 68.87
+  -> 52.44; at 256x256 UltraSharp 16.85 -> 15.18, RealESRGAN_x4plus 17.37 -> 14.61, 1x_Saiyajin 15.28 -> 12.46,
+  8x_NMKD-Typescale 25.14 -> 21.89, 2x_MangaScaleV3 15.42 -> 14.50, x4plus_anime_6B 6.33 -> 6.08. Output against plain
+  FP16: 60.0 to 69.8 dB on those weights, close to two builds of plain (about 63 dB). FP32 stays plain: nesting made one
+  1x file slower (44.08 -> 59.00 ms). Measured and left out: conv after upsampling at low resolution (the tail is 5.5 %
+  of the time), folding 0.2 into conv 5, and a Triton conv kernel (estimated slower than nesting across the network).
+- 2026-11-05 **Channel fixes**: Separate Alpha on a 1-channel engine; ONNX models above 4 planes read as what they are,
+  and AI Upscale refuses rather than drops planes; a clear message for multi-plane models; Save Image and View Image
+  (External) refuse plane counts no format holds; AI Upscale takes 4->4 and 4->3 engines through its bridge; Mixed
+  calibration noise has the model's planes; NCNN multi-plane input.
+- 2026-11-05 **TensorRT's GroupNorm kernel is silently wrong on small Dynamic ranges**: channels per group x max height x
+  max width at or below 20,736 (right from 25,088). Build Engine writes GroupNorm out for FP32 Dynamic engines up to
+  65,536, under a new cache key; other builds are unchanged. A general export change cost 2 to 6 % on Fixed and more on
+  Dynamic, so it stays out.
+- 2026-11-05 **PNG decode and encode faster**, not released. Pixels and file bytes unchanged. 3840x2160 RGB, Ryzen 9
+  9950X3D, all 32 threads, Load Image (reader + 8-bit to float32), medians over three paired runs in fresh processes:
+  own encoder 50.2 -> 11.1 ms, Pillow 50.2 -> 14.7, OpenCV 46.6 -> 14.3, Paeth rows 97.6 -> 45.6, own encoder at
+  7680x4320 311.7 -> 44.0; 48 real images of a dataset, all small, 138.0 -> 96.2 ms in total. Save Image's native path
+  22.75 -> 17.85 ms, its batch path 18.92 -> 17.13 ms.
+  - Independent IDAT pieces (the default encoder's bands) inflate in parallel (`png_inflate_pieces`, libdeflate's
+    `libdeflate_deflate_decompress_nonfinal`): a piece must end on an empty stored block at its last byte, and a match
+    cannot reach before its own output, so what succeeds is what a serial decode gives.
+  - One zlib stream of 1 MiB or more, compressed 5:1 or less, up to 512 MiB of rows, inflates on the pool
+    (`png_inflate.c`, the pugz technique, 2 to 6 times faster on inflate alone at 4K): threads decode from block headers
+    found by search, carrying markers for the unknown history, and the result stands only if their blocks chain exactly
+    from the real start to the real end and the Adler-32 holds; else serial from scratch. 2.1 to 3 times the filtered
+    size in added memory; a damaged stream costs 12 to 35 % more than serial alone before it falls back.
+  - Unfiltering runs as a wave across rows (`png_unfilter_rows`), Paeth in AVX2 (`png_unfilter_avx2.c`, right on all 2^24
+    inputs); the store step runs on the pool; the direct path's cap rose from 64 MiB to 2 GiB of filtered rows.
+  - The encoder keeps compressors and band buffers between calls (released with the NumPy pool's idle blocks at a run's
+    end, or by `numpy_pool.release()` with no pool); encoded files live in pool blocks, unzeroed; the native path checks
+    the folder exists before `create_directories`. Level 6, the band split and filter choices are untouched: 14,856
+    encoder comparisons and 346 written files equal.
+  - Accepted: a crafted stream with codes zlib refuses and libdeflate reads (length symbols 286, 287, distance symbols 30,
+    31, too many codes) opens where libpng fails. Already so below 64 MiB; rejecting them would change libdeflate's hot
+    decode path, and no valid file is affected.
+  - Tested: Windows 139,081 passed, 0 failed (`make_oracle.py` must run first after a native change); Linux 136,195
+    passed in the suite and 502 in the ROCm runtime, with 1 test corrected (its dispatch assertion depended on the thread
+    count, the stream's result did not). Whole-machine run of the wave's 16 workers under load, and CPUs other than Zen 5,
+    not measured.
+- RELEASED 2026-11-04 as **v0.3.9 re-release 2**: the entry below, and the AMD kit's docs and messages describe any
+  AMD machine reached over SSH; the notes no longer say AMD support has not run on an AMD GPU. Fork branch and tag
+  `v0.3.9` at `b65e73b0` (publish commit over `353b54d1`, tree = main `a5d13353`); assets win-x64 `c3429d1a…d797`
+  (176,375,072 B) and linux-x64 `355154b8…8f32` (147,426,223 B), both checked against git. Gate: Windows 139,031
+  passed, 0 failed. `D:\chaiNNer` updated (7 files, tuned binaries kept); 197 nodes.
+- 2026-11-04 **Cross-node fusion measured, dropped.** A 3840x2160 RGB chain, Load Image (PNG) -> Brightness &
+  Contrast -> Hue & Saturation -> Levels -> Unsharp Mask -> Save Image (PNG 8-bit), nodes called in-process with
+  their own output enforce, Ryzen 9 9950X3D: 117.4 ms, of which Load 52.1 and Save 23.8 (65 %). Fusing the four
+  processing nodes removes at most 3 whole-image passes of 3.6 ms (Invert Color's time): 9.1 % of the chain, under
+  the 10 % line set before measuring (25.7 % without Load and Save). The output range check of a node without
+  `assume_normalized` (Levels, Unsharp Mask) is one more read of the image, 3.6 ms at this size (Pending).
+- 2026-11-04 **A replaced engine or program frees its VRAM at once** (`tensorrt/cache.py`). Upscale
+  Image's session (TensorRT's context and buffers, MIGraphX's runner) outlives the run under its node id, so after Load
+  Engine or Load Program took another file, or was cleared or deleted, the old engine stayed alive with that session
+  until the Upscale node ran again. A cache built on another (`built_on`, keys `(value, ...)`) now has its entries on a
+  closed value released with it; a session in use goes when its run returns. RTX 5090, the process's dedicated memory
+  after picking engine B in Load Engine, before any run: ESRGAN 4x engines (A 23 blocks to 512 px, B 12 to 384 px)
+  3,310 -> 496 MiB; DUAL-XS 1x (fixed 256 and 192 px) 814 -> 598 MiB. After the run with B the old engine was already
+  freed before (2,114 -> 2,082 MiB).
+- RELEASED 2026-11-01 as **v0.3.9 re-release 1**: the entry below. Fork branch and tag `v0.3.9` at `353b54d1`
+  (publish commit over `925e92ec`, tree = main `565c2cd0`); assets win-x64 `4d6acc8e…e740` (176,374,621 B) and
+  linux-x64 `86df1a75…fe7e` (147,425,713 B), both checked against git. `D:\chaiNNer` updated (4 files, tuned binaries
+  kept); 197 nodes. Tests: the DUAL plugin tests on D:'s Python (43 passed with the GPU hidden; the attention kernel's
+  21, its GPU cases included, on the RTX 5090) and MIGraphX's DUAL tests in WSL with ROCm's Triton (34 passed).
+- 2026-11-01 **DUAL TensorRT plugins faster** (`dual_na_kernel.py`, `dual_aot.py`). Neighborhood attention takes its 32
+  content channels and 16 positional-bias channels as two dot products into one FP32 accumulator (no padding of 48
+  channels to 64) and runs 64-query programs on 4 warps (was 128 on 8), each pair keeping its 128-query parent's key
+  origin, 64-key blocks and bias frame, so every row reduces in the same order; RCA's value application runs 64
+  positions per program (`APPLY_BT`, was 256), each output's four-region order kept; the residual addition before a
+  dynamic router's Transpose, FP32 Cast and ReduceMean is its own BF16 plugin (`router_add`), which keeps TensorRT
+  from a slow fused Add/Transpose/Cast/Mean. RTX 5090, TensorRT 11.4, DUAL-XS 4x at 512x512, BF16, optimization
+  level 3: 61.99 -> 58.03 ms (attention products and `APPLY_BT`), then 58.41 -> 54.81 ms (smaller attention programs
+  and `router_add`), full engines bit-identical to the old ones on the synthetic inputs tried. Through chaiNNer-C's
+  build (XS 1x at 256x256, synthetic weights): the same error against PyTorch FP32 as before (relative L2 0.002148,
+  max 0.00579). MIGraphX's DUAL route shares the attention kernel (4 parts per tile now; compiles for gfx1100, gfx942
+  and gfx1201) and keeps 256 positions per value-application program (not measured on AMD). The engine build cache
+  hashes both files, so engines rebuild; engines built before keep the old kernels.
+- RELEASED 2026-11-01 as **v0.3.9**: fork branch and tag `v0.3.9` at `925e92ec` (publish commit over `0b597ed0`, tree =
+  main `118e7bf5`); assets `chaiNNer-C-v0.3.9-win-x64.zip` SHA-256 `cc9c8b4c…137a` (176,373,176 B) and
+  `chaiNNer-C-v0.3.9-linux-x64.zip` `74e2f937…a806` (147,424,287 B), both checked against git (every backend file
+  equal; the Windows binaries equal the README hashes). Gates: Windows 139,026 passed (the unseeded VOSR streaming test
+  failed; it fails 2 in 7 alone), Linux 136,107 passed at `92e056a9`. `D:\chaiNNer` updated (212 files) with its
+  tuned set rebuilt from this tree (DLL `745B33D7`, graph `9050BF6E`, ext `A603F216`; exports equal to the portable
+  DLL) and spandrel c12; 197 nodes. `npm run make`'s Squirrel maker fails since `58e069b1` (electron-winstaller's
+  install script, which puts `7z.exe` in place, is denied); the zip maker is unaffected: Pending.
+- 2026-11-01 **v0.3.9**: the version label (eight files, as v0.3.8's), and everything below since v0.3.8 re-release 5.
+  The release ships a Windows zip with the AMD GPU parts (`Build.ps1 -RocmRoot -MigraphxRoot`; the seven other
+  binaries byte-identical to a build without them) and, for the first time, a Linux zip
+  (`native/tools/build_linux_release.sh --rocm --migraphx`).
+- 2026-10-30 **CPU FP32 in channels-last order; spandrel 0.4.2+c12; AMD kit checks** (not released).
+  - **Channels-last.** PyTorch upscales on the CPU in FP32 take their input in channels-last order, as BF16 does:
+    4x-UltraSharp 2.212 -> 1.425 s/image, 4xLSDIRCompactN 0.0476 -> 0.0391 (Ryzen 9 9950X3D, 256x256); outputs move
+    by 1 code on 0.006-0.008 % of values. MixDehazeNet keeps NCHW (15 % slower in channels-last, random weights at
+    128 px; every other architecture measured within 5 % or faster). GPUs and FP16 unchanged.
+  - **spandrel c12.** Depthwise 3x3 convolutions and ESRGAN's dense blocks run on HIP kernels under ROCm (adapted
+    from spandrel-rocm, MIT; Windows and Linux; compiled with HIPRTC for the GPU present; any failure falls back to
+    PyTorch, `SPANDREL_HIP_KERNELS=0` turns them off). Compiled here for gfx1201, gfx1200, gfx1100, gfx1101, gfx1030,
+    gfx942, gfx90a and gfx908; not yet run on an AMD GPU.
+  - **AMD kit.** Two steps after the chains: every spandrel architecture with random weights on the GPU in FP32,
+    FP16 and BF16 against the CPU (58 architectures as 61 networks; a crash or NaN fails), and the HIP kernels off
+    and on for ESRGAN and DAT2 (difference and time).
+- 2026-10-29 **Type check; large 16-bit grey+alpha TIFFs** (not released): `npm run type-check:py` has no errors (25
+  at `e7a16a33`, 49 warnings unchanged); 16-bit grey+alpha TIFFs above 89.5 MP keep their alpha and depth since the
+  image-size limit replaced Pillow's (a test pins it).
+- 2026-10-29 **VapourSynth catalog and node inputs** (not released): what always fails with vs-jetpack 2.2.6 is left
+  out (23 base classes, 51 by-name kernel and scaler choices, MVTools methods that need analyze(), methods needing an
+  object no input gives or giving no clip: a version-keyed table in `scan.py`, measured by running every class choice
+  with VapourSynth R81); `*clips` parameters and vs-jetpack's aliases (Morpho.black_hat) take their inputs; a union
+  setting gets an Advanced "as a Python value" input; expression arrays take a list per plane and norm_expr plain
+  text; FilePathType is a file input; a plugin's `range` is a colour range only beside `range_in`; AI Upscale scales
+  the SAR with a non-uniform model; a "*" file input takes a dropped file.
+- 2026-10-29 **VOSR caches: corrupt and unused engine sets, the DiT's BF16 copy** (not released).
+  - **Engine sets.** A compatible BF16 set with a missing or changed plan no longer stops every later run: the
+    migration moves it to `quarantine-*` and builds afresh (two compatible sets with different plans still stop the run,
+    naming both). Once the current BF16, FP8 or MIGraphX set is valid, under its cache lock, it is marked used and
+    the sets of other identities unused for 14 days (1.7 to 3.5 GB each; builds sharing the storage folder keep theirs),
+    `quarantine-*`, `building-*` and killed migrations' `migrating-*` folders are moved aside and deleted, each logged
+    with its size; a set with an open file stays whole; another GPU's set, timing caches and unknown folders stay.
+  - **BF16 copy of the DiT.** The PyTorch backend's BF16 load reads `ema_model.bf16.safetensors` (2.8 GB, made by the
+    first load in 5 s, its SHA-256 remembered like the official files') instead of converting the 5.6 GB FP32 weights.
+    CPU, synthetic checkpoint of the real layout: cold file cache 2.09 -> 0.89 s, warm 0.86 -> 0.19 s, a repeat load
+    in one process 0.83 -> 0.42 s, peak working set 9.2 -> 3.5 GB. DINOv2 (0.23 s) still converts.
+- 2026-10-29 **App and backend residuals** (branch `batch-electron`; not released): a backend failure's exit writes
+  the settings first (`gui/backendFailure.ts`); the backend's start removes pip's `~` folders in the integrated
+  Python (none while another process runs it) and FFmpeg setups' `.part`/`.tmp` of ended processes in the storage
+  folder (`leftovers.py`); the atomic writer keeps a file's long name for its 8.3 short name (`_chainner_graph.pyd`
+  rebuilt); a node module failing the same way at two starts in a row no longer keeps the node list out of the UI
+  cache (`load_failures.py`); Stop ends Get Native Resolution's packet-index scan; `/packages` without its dead loop.
+- 2026-10-29 **Electron 43.8.3 -> 45.1.0** (branch `batch-electron`; not released): the clipboard on Electron 44's
+  promise API (`src/main/clipboard.ts`, `clipboardImage.ts`). A chain is still copied as its JSON under the raw format
+  `application/chainner.chain` (pastes to and from v0.3.8); the image paste keeps its alpha rule; a screenshot goes
+  through Chromium's bitmap write as before. A paste is one call (`clipboard-readForPaste`: chain, else image, else
+  types). Backend output is logged line by line, a log line at its own level, bare prints included (the exit
+  message's last output too keeps whole lines). `allowScripts` denies the four install scripts npm 11.19 skips. Live
+  clipboard checks: Pending.
+- 2026-10-29 **Model conversion fixes** (batch branch `batch-convert`; not released). PyTorch's Convert To NCNN
+  refuses DRFT (both kinds) and NAFNet by name: their shapes follow the image's size, which NCNN cannot express (they
+  failed with the converter's bare IndexError or KeyError). ONNX's Convert To NCNN names a tensor the model computes
+  where NCNN needs a constant, and raises to a scalar integer with ncnn's UnaryOp square (2) or Power layer (ncnn's
+  pow gave about 2.4e38 for a negative base). Upscale Image, Inpaint and Upscale Face run a model in another precision
+  or on another device as a kept copy, and Interpolate Models no longer moves its inputs, so a shared model is never
+  changed in place. Convert To ONNX keeps one export per node and model (two nodes converting one model with different
+  options no longer export on every run). Type check: 60 errors to 15 (the rest in files other batch lanes change),
+  each fixed at its cause; a Reorg stride given as a list is refused by name. Debug builds leave chainner_ext out
+  (Python.h would link python314_d.lib). Retired: stack()'s unused sequence mode and the unused grayscale check.
+- 2026-10-29 **CPU BF16 for PyTorch** (branch `batch-bf16`; not released). Use BF16 Mode (CPU), off by default, after
+  Use FP16 Mode: where PyTorch runs on a CPU with AVX-512 BF16 or AMX, Upscale Image (PyTorch) runs the forward under
+  `torch.autocast` BF16 (weights stay FP32, channels-last input) for models spandrel marks bfloat16-capable. Other
+  CPUs show the toggle disabled and fall back to FP32 with one log line (oneDNN's emulated BF16 is 1.5-2.4x and AVX2's
+  generic path 6-10x slower than FP32). Ryzen 9 9950X3D, 48 images 256x256, FP32 -> BF16 s/image: 4x-UltraSharp
+  2.14 -> 0.66 (PSNR 51.7 dB mean, 50.5 min, max 6 codes), 4xLSDIRCompactN 0.053 -> 0.040 (47.3 / 46.8 dB, max 20);
+  through Upscale Image 2.76 -> 0.81 and 0.046 -> 0.024. Report: `native/local/batch-20261029/lane-bf16`.
+  - **Get Native Resolution on rotated video.** The light models read a video's RGB as stored, as its As stored
+    plane: Load Video's upright frames made a display matrix's quarter turn a size the reader refused and its half
+    turn an upside-down raster (`getnative_media.py`).
+  - **VOSR temporal tests.** The removed Temporal Sequence generators and the one-thread stabilize, kept verbatim as
+    oracles, gave way to golden float32 outputs of tiny clips recorded from them
+    (`native/tests/golden/vosr2_temporal.npz`, 730 KB; `native/tools/vosr2_temporal_golden.py`): within 1e-5 inside
+    a 4-pixel margin and 1e-4 on average, as OpenCV's flow moves a few edge pixels by up to 0.01 with AVX2 off.
+- 2026-10-29 **Descale and Riemersma guards** (batch, not released). Descale's Mirror border repeats its reflection
+  past the target's size (the vendored solver patched, `third_party/descale/PATCHES`) instead of refusing; parameters
+  that leave a target pixel without weight (Blur 0.01 Bilinear gave black) or give non-finite weights are refused,
+  naming Blur or the source window; every other result is bit-identical. Riemersma's History Length is checked
+  against 682541919, above which its float32 decay base is 1.
+- 2026-10-29 **ONNX and TensorRT small fixes** (batch run, not released): the ONNX size probe finds multiples
+  of 12, 24 and 48; pads to at least 16 px where shape inference gives no minimum (a converted OmniSR ended the
+  process below 12 px, and now matches PyTorch from 3x3 px), also where the probe gets no answer; probes a model
+  that does not run once per file content (a run short of memory is not kept); concurrent first uses share one
+  session, and two loads of one file share a TensorRT or MIGraphX session (one engine folder); a DRFT plugin ONNX
+  loads without four tracebacks; a non-float model input is named; Build Engine sizes start at 49 px, where an
+  engine tiles larger images. Convert To ONNX records the model's minimum and multiple in the ONNX, which ONNX
+  Upscale Image pads to (an SST with 24 px windows was 0.82 off PyTorch at 20x23), and traces RealCUGAN at 33 px,
+  which keeps its crop of odd sizes (0.10-0.14 off before; now within 1e-6 at 33x35, 37x51, 41x40).
+- 2026-10-29 **VapourSynth processes, user modules, uninstall** (branch `batch-vsproc`; not released). vspipe and the
+  catalog scan end with their worker, also a killed one (`nodes/impl/owned_job.py`: the worker's kill-on-close job on
+  Windows, a parent-death launcher on Linux; `OwnedJob` moved there); a scan past 120 s names the import it was in.
+  The host installs the user modules of `user_modules.toml` at a start with the worker stopped (the node import only
+  scans), each with an optional version spec. Preview Clips checks a copy before it rewrites an open window's script,
+  reports a vsview that ends at once with its log, and keeps the window over a worker restart (`vsview.pid`). An
+  uninstall also removes what pip pulled in that nothing staying needs (VapourSynth: 55 distributions, ~1 GB on Linux).
+- 2026-10-29 **Executor fixes** (not released). A chain of more than 500 nodes in a row is refused when its run
+  starts, naming its first and last node (`MAX_CHAIN_DEPTH`; before: a recursion error from about 495 pure nodes on
+  the Python executor, 990 on the engine); 500 run on both executors. On `CHAINNER_C_EXECUTOR=python`, Stop during a
+  lazy read now waits for the input's node, so the run, and the server's release of its memory, end after it. A lazy
+  input a node did not read (a Conditional's untaken branch) frees its upstream after its last other read, not at
+  the run's end (the engine also when the upstream runs later). A serial producer run ahead runs its own node
+  cleanups after itself, outside its time (Python executor; the engine already did). A connection into a lazy input
+  counts as 5 nodes in a row (the engine runs 124 computed Conditionals in a row; 99 are accepted). A starved pool's
+  error ends a long lazy series at once (it waited 1 s per link beyond the pool). A Save Image folder computed by a
+  pure node (Text Append, Directory) is computed before a look-ahead at item 0 decides the item window, so Temporal
+  Fix keeps its look-ahead (both executors). An engine fault outside a node's job names the node being run, or the
+  run's phase.
+- 2026-10-29 **Test storage, generator shortfall, Save Image paths** (branch `batch-io`; not released). Tests keep
+  to their own storage folder (`native/tools/scratch_storage.py`: `native/local/test-storage` with the pinned
+  FFmpeg, which `run_tests.py` sets up; started backends get `--storage-dir`), never `%APPDATA%\chaiNNer`;
+  `backend-nodes.test.ts` fails on a node module that fails to load for any reason but a dependency not installed.
+  A generator whose items end early warns once at its end, on both executors: Load Video on a cut file says
+  "ended after 150 of about 300 frames" (its header's count) and the run succeeds. Save Image (and Save DDS
+  Texture) refuses a Subdirectory Path or name with a `..` component or an absolute value, on both executors,
+  and on Windows one with a device name (NUL, CON, COM1, ...).
+  AVIF's 4:0:0 is labelled Grayscale (it drops the colour). 16-bit grey+alpha TIFFs load with their alpha at 16
+  bits (OpenCV gave 8-bit grey).
+- 2026-10-30 **Upscale run-ahead removed** (not released): PyTorch, ONNX and NCNN Upscale Image no longer run ahead
+  of earlier items; they run on the driver again, and of the upscales only TensorRT's and MIGraphX's run ahead. The
+  feature (2026-10-29: one thread per device in `device_thread.py`, combined VRAM caps in `memory_cap.py`, a
+  per-input unread flag in the engine's plan, a failing run's give-up for work computed ahead, a Pause/Stop check
+  before each upscale) was removed on 2026-10-30 because its gain (ONNX +31 %, PyTorch +9 %, NCNN +5 % on an RTX
+  5090) did not justify the code. The offload's and VOSR's VRAM caps are as before it. Its gate behind lazy inputs
+  is back for TensorRT's and MIGraphX's upscales: none is computed ahead behind a lazy input its node may leave
+  unread (Save Image's image with Skip existing files on or connected, a Conditional's other branch), where v0.3.8
+  computed them and threw them away (`execution_scheduler.may_go_unread`, the plan's per-input unread flag).
+- 2026-10-29 **TensorRT engine caches, Windows CUDA loading, installer, VapourSynth on glibc 2.28** (not released).
+  - **ONNX TensorRT cache.** ONNX Runtime 1.30's engine file name hashes tensor names, never weights
+    (`TRTGenerateId`), and chaiNNer creates sessions from bytes, so two models of one architecture shared an engine:
+    on the RTX 5090 the second model gave the first one's output. Each model now keeps its engines in
+    `<cache>/<sha256[:32]>` (`session.py`); the timing cache (tactics per layer) stays shared. Old engine files at
+    the cache root are never read again; Clear Cache removes them.
+  - **CUDA on Windows.** Without torch imported (a VapourSynth script's process, or a worker whose torch failed to
+    import), ONNX Runtime's CUDA and TensorRT providers took cuBLAS/cuDNN from PATH (a cuDNN for CUDA 12 aborted the
+    process). A CUDA or TensorRT session now first runs ONNX Runtime's `preload_dlls` from PyTorch's `torch\lib`
+    when torch is installed but not imported; without the PyTorch package the error says to install it.
+  - **Installer.** `dependencies/run_chainner_pip.py` runs the bundled chainner_pip 23.2 with pip's fix for
+    pypa/pip#11847: wheels resolved from PEP 658 metadata (the PyTorch indexes' torch, triton, ...) download once
+    (a Windows NVIDIA PyTorch install fetched the 2 GB torch wheel twice); the progress names the file's package.
+    Install All and Update All count each dependency once and only what is missing or outdated.
+  - **VapourSynth on glibc 2.28-2.34.** vapoursynth-akarin 1.5.0 and vapoursynth-nlm-ispc 4.1 built for
+    manylinux_2_28 from the unchanged sources, released on the forks `Rift73/vapoursynth-akarin`
+    (`v1.5.0-glibc2.28`) and `Rift73/vapoursynth-nlm-ispc` (`v4.1-glibc2.28`) and pinned by SHA-256 below the glibc
+    PyPI's wheels need (2.35, 2.34); same frames as PyPI's builds in 28 cases on Rocky 8, Ubuntu 20.04 and Rocky 9.
+    vsview is left out below 2.34; a missing libatomic is named for VapourSynth without stopping the launch.
+- 2026-10-29 **DDS on Linux** (branch `prep-dds` over `chaiNNer-C` `0291226e`; not released). Linux reads and writes DDS
+  through `native/texconv`, a texconv for the options chaiNNer passes (`native/src/image_io.cpp`), built on DirectXTex
+  may2026, the release Windows' texconv.exe 2026.5.8.1 comes from, with DirectXMath apr2025, DirectX-Headers v1.619.5
+  and the .NET runtime's `sal.h` (all MIT), fetched at configure time and pinned by SHA-256. Each step is texconv's own
+  with its DirectXTex calls; what texconv.exe does through WIC (Windows' imaging component) and MSVC's `/fp:fast`
+  arithmetic are rebuilt from measurements of texconv.exe: WIC's conversions for the intermediates' pairs (5:6:5,
+  5:5:5:1, BGRX, grey), WIC's Fant, nearest-neighbour and linear scaler (the default mip filter, BOX, FANT, POINT, LINEAR), reciprocal division in DirectXTex and
+  texconv.exe's BC4/BC5 UNORM gradient arithmetic. BC6H and BC7 compress on the CPU, spread over threads as texconv.exe
+  does with OpenMP (4096x4096 BC7 with mips: 142 s, texconv.exe `-nogpu` 171 s). The zip carries `texconv` and its
+  notices (`texconv.LICENSE.txt`); Windows is unchanged (`_chainner_graph.pyd` and `chainner_native.dll` rebuilt
+  byte-identical).
+  - **Verified.** `native/tests/test_texconv.py`: 193 cases of chaiNNer's command lines (every offered format with and
+    without mips, grey and opaque sources, compression, alpha and mip filter options, cubemap, array, volume), file
+    and read-back pixels against texconv.exe's digests (`golden/texconv.json`): Windows 194 passed; Linux 184 passed,
+    10 listed in `linux_differences.json` (`texconv-wic-*`). A wider matrix (1,425 writes, 2,332 reads): every read
+    and every write equal except WIC's cubic mip filter on 8-bit formats and its linear one on formats it scales as
+    float (not rebuilt, DirectXTex's filters there: 12 % of the levels' samples differ, by up to 2 steps, more on SNORM, whose negative values WIC
+    clips to 0), a colour image saved as R8_UNORM or R16_UNORM (WIC's grey: 3.6 % of samples one step apart at 8 bits, up
+    to 2 steps of 65535 at 16 bits), and the mip levels of formats WIC scales as float (SNORM, 4-bit, 4:2:2, 8-bit
+    integer: 0.1 to 6 % of samples, a few steps apart at most) and their `-sepalpha`; BC3 with alpha dithering differs at some
+    ties on larger images (not rebuilt). `test_dds.py` runs on Linux but for texconv.exe's own options.
+- 2026-10-29 **AMD GPUs: ROCm 7.14.1 and MIGraphX 2.16.1** (branch `amd` over `chaiNNer-C` `ebf96abd`; ships in
+  v0.3.9). Design, decisions and the per-area reports: `native/local/amd-20261029/`. No AMD GPU ran any of it yet:
+  what needs one is an `amd_gpu` test (`native/AMD.md`).
+  - **What.** Where an AMD GPU with 8 or more compute units is found and no NVIDIA GPU (`gpu.amd`: KFD topology on
+    Linux, HIP in a child process on Windows, HIP's device order and visibility variables), the packages install AMD
+    builds: PyTorch 2.14.1+rocm7.14 (Linux) or AMD's 2.12.0 (Windows) with only that GPU's kernel wheels (the bundled
+    `rocm 7.14.1+chainner` meta package needs none of the others), and ONNX Runtime 1.30.0 with MIGraphX (fork release
+    `v1.30.0-rocm7.14`; Windows adds DirectML, the default there). New: the MIGraphX package (Build, Save and Load
+    Program, Upscale Image, Get Program Info) on the native runner `_chainner_migraphx` (`native/migraphx_runner/`,
+    MIGraphX unpatched; nodes of domain `chainner` reach custom ops through `custom_op.h`), with DRFT's kernels and
+    VOSR's qkv ported to HIP (`native/src/drft_hip`, `vosr2_hip`) and DUAL's Triton kernels compiled for the GPU as
+    MIGraphX ops (`native/src/dual_hip`, Linux only: no Triton for AMD on Windows); VOSR's MIGraphX backends (FP8 by
+    MIGraphX's own quantisation on gfx942/gfx950/gfx12xx); HAT's and DAT's attention in PyTorch's fused AMD kernels
+    and, exported on a ROCm torch, in the layout MIGraphX fuses (spandrel `0.4.2+c11`); an installer that uninstalls
+    the builds an AMD dependency replaces (`Dependency.replaces`), and the reverse: on a computer with an NVIDIA GPU or
+    none, a folder from an AMD computer gets NVIDIA's or the CPU builds in place of the ROCm PyTorch, ONNX Runtime's
+    MIGraphX build and Triton for ROCm, and ROCm's runtime wheels leave with them. NVIDIA and CPU machines without AMD
+    builds choose, install and show what they did before.
+  - **How built.** `native/cmake/rocm.cmake` with `CHAINNER_C_ROCM_ROOT` and `CHAINNER_C_MIGRAPHX_ROOT`
+    (`build_linux.sh`, or `Build.ps1 -RocmRoot -MigraphxRoot`): HIP code for every target ROCm 7.14.1 ships (25 on
+    Linux, 22 on Windows). MIGraphX and the ONNX Runtime wheels: `native/tools/migraphx/` (Linux; `windows/`), the
+    release build's `--migraphx` must be that build. `native/tools/build_linux_release.sh --rocm --migraphx` adds the
+    four AMD modules to the zip.
+  - **Verified.** HIP kernels built through HIP's NVIDIA path equal the CUDA originals on the RTX 5090 (runner kernels
+    byte for byte in 1884 cases, DUAL's ops bit for bit, DRFT within one BF16 step, VOSR's qkv bit for bit); MIGraphX's
+    CPU reference target compiles DRFT's whole graph with its 21 custom nodes and round-trips programs; NVIDIA's HAT-L
+    and DAT2 outputs and exports byte-identical to before; the existing Windows binaries byte-identical with the AMD
+    parts on or off. Full suites: Windows 137,809 passed and Linux 135,384 passed (failures were test-side only and
+    fixed, reruns clean); the ROCm runtime's AMD-side tests pass on the CPU. Fixed on the way: a fresh install's first
+    start (`dependencies/store.py` imported `packaging` before installing it) and CPU-only PyTorch (`offload.py`
+    imported a GPU-only torch call).
+
+- 2026-10-29 **Linux x86-64** (branch `linux` over `chaiNNer-C` `225e1765`; Linux zips ship from v0.3.9). Design,
+  decisions and the per-area reports: `native/local/linux-20261029/`.
+  - **What.** A portable zip (`chaiNNer-linux-x64/`, started by `chaiNNer.sh`) for x86-64 Linux with glibc 2.28 or
+    newer. Every node and package that works on Windows works there, on the CPU, on NVIDIA GPUs (PyTorch, TensorRT
+    with the DUAL, DRFT and VOSR plugins, ONNX Runtime with its TensorRT provider) and on Vulkan (NCNN, defaulting to the CPU where every Vulkan
+    device is software). The launcher probes whether Chromium's sandbox can start and starts without it only where it
+    cannot (`CHAINNER_SANDBOX`), checks the system libraries Electron, OpenCV and VapourSynth link against and prints
+    the install command of the distribution (`CHAINNER_SKIP_LIBRARY_CHECK`), and gives `run` a virtual display
+    (`xvfb-run`) when there is none. Copy To Clipboard calls `wl-copy` or `xclip`. DDS goes through chaiNNer-C's
+    texconv for Linux (`native/texconv`, below). Limits: below glibc 2.34 VapourSynth's
+    Preview Clips cannot open vsview (its Qt needs 2.34); ONNX Runtime has no Intel GPU provider there (CPU; AMD: above); C-library math
+    follows the system's libm, so a few results can differ from Windows in the last bit (Linux twins of the golden
+    manifests, `native/tests/golden/linux/`).
+  - **How built.** `native/build_linux.sh` configures `native/toolchain-linux.cmake` and `native/cmake/linux.cmake`:
+    clang and `ld.lld` 23.1.2 with the Windows build's options in clang's spelling (ThinLTO, `-ffp-model=strict`,
+    dynamic denormals, `-Wall -Wextra -Werror`), `libstdc++` and `libgcc` static, seven modules (`.so`, same directories
+    as the Windows ones). Windows code is untouched: Linux code sits in `#else` branches and `if(NOT WIN32)` blocks.
+    `native/tools/build_linux_release.sh` builds one commit in the image `cnl-build` (Ubuntu 22.04 with a Rocky 8.10
+    glibc 2.28 sysroot, since LLVM's binaries need glibc 2.34; every download pinned by SHA-256), checks the modules
+    with `native/tools/check_glibc.py`, and makes the zip with `npm run make-linux-zip`. The Linux Python stack is
+    `native/python-stack.lock.linux.txt`, provisioned by `native/tools/provision_runtime.sh`. ONNX Runtime is the fork
+    release `v1.30.0-trt11`'s `1.30.0+trt11.4` on both systems now (TensorRT 11.4.0.106; the Linux wheel is
+    manylinux_2_28 and adds Hopper's architecture).
+  - **Verified.** Per change: the Linux build and the tests naming the touched files, and for a shared file the Windows
+    build and its tests (rebuilt binaries byte-identical to the base's, bar the nvcc-built plugin DLLs, whose bytes
+    follow the checkout path). On an RTX 5090 under WSL, against PyTorch: a PyTorch ESRGAN equals the CPU at 92 dB, DUAL
+    through TensorRT matches at 63 dB, a small DRFT engine at 59.6 dB and the native TensorRT runner at 101.6 dB; NCNN
+    on Vulkan (software) and on the CPU equals NumPy exactly. The release build's modules need at most GLIBC_2.28 and
+    load in `rockylinux:8` (glibc 2.28) and `ubuntu:20.04`; the launcher's check ran against ten bare distribution
+    images (Ubuntu 20.04 and 24.04, Debian 12 and 13, Rocky 8, Fedora, Arch, openSUSE Leap 15.6 and 16.0, Tumbleweed).
+    Untested: a VOSR TensorRT build end to end, NCNN on a real Vulkan GPU, AMD and Intel GPUs, the desktop clipboard and
+    drag and drop outside WSLg. Full suites: Linux 135,092 passed, 0 failed (2,876 skipped, each with its reason:
+    Windows-only behaviour, or a Linux NumPy or OpenCV build that rounds differently from the Windows one, listed in
+    `native/tests/linux_differences.json`, where the native result was checked equal to Windows'); Windows 137,329
+    passed (the unseeded VOSR2 streaming test failed once and passes alone), and all seven Windows binaries rebuilt
+    byte-identical. The release zip ran a Load Image, Resize, Save Image chain headless on Ubuntu 20.04 and 24.04,
+    Debian 12, Rocky 8, Fedora, Arch and Tumbleweed with byte-identical output, and started under WSLg; through
+    chaiNNer-C's session code ONNX Runtime's CUDA and TensorRT providers match the CPU on the 5090. Open: VapourSynth on glibc 2.28 to
+    2.34 (a glibc 2.28 build of `vapoursynth-akarin` and a PySide6 override).
+- RELEASED 2026-10-25 as **v0.3.8 re-release 5**: DUAL neighborhood attention in both routes (spandrel 0.4.2+c10,
+  wheel SHA-256 `24967414…b50f`, release commit `5b4ed67`; the TensorRT exporter's `DualNA` node and AOT kernel). Fork
+  branch and tag `v0.3.8` at `b5ffdf03` (publish commit over `b114b776`, tree = main `bbe9ce60`); asset SHA-256
+  `9B3BB1D3…1317` (zip verified against git, 0 mismatches). Gate 137,277 passed with c10 installed (matting test
+  skipped; the first run's one failure, `test_streamed_full_vae_matches_direct_encode_decode`, is an unseeded test that
+  fails by shard order, passed 8/8 alone and in the repeat). `D:\chaiNNer` updated (15 files; tuned binaries kept) with
+  spandrel c10 installed; 197 nodes.
+- RELEASED 2026-10-24 as **v0.3.8 re-release 4**: the worker leaves expandable_segments out of an inherited PyTorch
+  allocator setting (a user's FIGSR and FDAT runs failed `!handles_.at(i)` after one out-of-memory tile), and spandrel
+  0.4.2+c9 (released GaterV3 models load; GaterV3, SMoSR, FIGSR and GFISRv2 checked against resselt). Fork branch and
+  tag `v0.3.8` at `b114b776` (publish commit over `e30ea7b2`, tree = main `63755028`); asset SHA-256 `CA52B08E…B421`
+  (zip verified against git, 0 mismatches). Gate 137,269 passed with c9 installed (matting test skipped while training).
+  `D:\chaiNNer` updated (4 files; tuned binaries kept) with spandrel c9 installed; 197 nodes.
 - RELEASED 2026-10-24 as **v0.3.8 re-release 3**: spandrel 0.4.2+c8 (WSR, GaterV3, SMoSR, FIGSR, GFISRv2; FDAT's
   DySample without CUDA). Fork branch and tag `v0.3.8` at `e30ea7b2` (publish commit over `f426929a`, tree = main
   `a0cfcee2`); asset SHA-256 `82787155…68C0` (zip verified against git, 0 mismatches). `D:\chaiNNer` updated (2 files;
@@ -430,11 +775,12 @@ Current state, pending work and the decision log. Commands: `README.md`. Design:
   producers, fail-fast loops, a pool with the threads its waits need); GPU check, Load Video -> VOSR -> a 3-ahead
   consumer, 30 frames: VOSR bit-identical to its references, served 3 ahead to the end. No device lock: GPU nodes may
   overlap as before. Elsewhere (side effects, deferred errors) it mirrors the past side.
-- Descale (2026-10-16): Image > Dimensions > Resize; vapoursynth-descale Release 12 (MIT, vendored unchanged in
-  `native/third_party/descale`) under `src/descale_ops.c`, which runs its row and column passes on the pool in a
-  workspace the bridge takes from NumPy. Bit-identical with the Release 12 VapourSynth plugin (12/12 cases, kernels,
-  shifts, fractional sizes, borders); 1080p -> 720p RGB 1.0-1.5 ms (first version 9.7-10.4 ms, fresh 52 MB per
-  call). A lane-for-lane AVX-512 port (bit-identical) gave no end-to-end gain (memory bound) and is not built.
+- Descale (2026-10-16): Image > Dimensions > Resize; vapoursynth-descale Release 12 (MIT, vendored in
+  `native/third_party/descale` with one patch since 2026-10-29, `PATCHES`) under `src/descale_ops.c`, which runs its
+  row and column passes on the pool in a workspace the bridge takes from NumPy. Bit-identical with the Release 12
+  VapourSynth plugin (12/12 cases, kernels, shifts, fractional sizes, borders); 1080p -> 720p RGB 1.0-1.5 ms (first
+  version 9.7-10.4 ms, fresh 52 MB per call). A lane-for-lane AVX-512 port (bit-identical) gave no end-to-end gain
+  (memory bound) and is not built.
 - Branch `chaiNNer-C` on upstream `d56e507f`. SP1 took `native/` from the `c-port` branch at `c081e940`; that branch is kept as-is, with the SP1 plan and its execution rulings on top.
 - One backend: `backend/src` = B0 (426 files) plus SP2's, SP3's, SP3b's, SP4a's, SP4b's and SP4c's edits (ARCHITECTURE section 2) and rebuilt binaries (git-ignored);
   the sources are tracked with their shipped bytes. Until SP1 the package was the installed backend plus 216 overlays applied through delegates, transplants and AST pins; that mechanism is retired (it and prior history: tag `chainner-c-checkpoint-20261001`, `fede43d8`).
@@ -520,6 +866,17 @@ Current state, pending work and the decision log. Commands: `README.md`. Design:
   under the BF16 floor, max abs <= 0.0116. The C++ plugin route (CMake + nvcc + MSVC, vendored TensorRT headers,
   TensorRT SDK Path) was removed in the commit after `cb735a43`; reverting that commit restores it (ruling ruling).
   TensorRT loads embedded plugins without `engine_host_code_allowed`, so no trust gate.
+- DUAL neighborhood attention (2026-10-25, the owner's handoff `DUAL_Optimized_NA_chaiNNer_Handoff.md`): the vendored
+  source is traiNNer's `b73554e5…` (context layers = neighborhood attention: each query attends its own clamped 32/64
+  neighborhood; weights unchanged), and spandrel 0.4.2+c10 runs it (bitwise vs the source on CPU FP32; inference
+  batches whole tile rows, capped by mask size). The exporter emits `DualNA_<key>_TRT(qkv, bq, bk; window)` at each
+  context site whose trunk exceeds its window (a dynamic export at every context site); `dual_aot` lowers it to the
+  `na_<key>` / `na_c<C>` AOT plugins running `dual_na_kernel.na_attention` (the research kernel generalized to
+  run-time H/W and small trunks; bitwise vs it where it applies; 28672 B shared on sm 86/89/120). Manifests record
+  `"context": "na-v1"`; an ONNX without it still builds, with a log warning. Build Engine refuses a dynamic maximum
+  beyond the kernels' 32-bit indexing. Research input 512x692 on the 5090: engine vs the owner's accepted NA image
+  MAE 0.30/255, P99 2, max 7 (the research engine's numbers); legacy 18.05 / NA 19.62 / research engine 19.45 ms;
+  PyTorch FP16 67.8 -> 107.3 ms. Records: `native/local/dual-na-20261025/` (design, lane reports, review, bench).
 - DUAL speed (2026-10-09): Light x4 512x512 was ~2x the 2026-10-04 DUAL3 PU2 D16 engine (14.33 ms). Per-layer
   profiles: (1) AOT kernels compiled without Triton's 16-byte pointer-alignment hint (scalar loads; core 2.13 vs
   0.156 ms per layer), fixed in `5ca20024`; (2) the exporter moved every 3x3 after a PixelShuffle ahead of it (4x work
@@ -572,7 +929,7 @@ Current state, pending work and the decision log. Commands: `README.md`. Design:
   EXIF orientation; straight-alpha and grey+alpha TIFFs; TIFF ExtraSamples; lossless WebP `exact`; GIF palette per
   frame; CPU-only NCNN tiles by available RAM; a vitest runs the app's schema check over the real node list; CLI ends its
   backend; system-Python option removed; Python download honours the proxy; pip's errors reach the UI; Spandrel
-  `0.4.2+c9` (fork release `v0.4.2-c9`, SHA-256 `0e3c2022…`; c2: fp32 LayerNorm statistics in fp16 for 11 archs, ONNX
+  `0.4.2+c10` (fork release `v0.4.2-c10`, SHA-256 `24967414…`; c2: fp32 LayerNorm statistics in fp16 for 11 archs, ONNX
   padding per input for 12; c3, 2026-10-16: DUAL runs in fp16, its last group's dynamic conv in fp32, 1x Light 512²
   343 → 199 ms, 2x 87 → 52 ms vs fp32+TF32; c4, 2026-10-18: HAT and DAT run in fp16, the last group's closing conv
   and the final norm in fp32 (trained 4x HAT-L writes 722k there, DAT2 121k), 70-71 dB from fp32, 256² HAT-L 476 → 250
@@ -589,7 +946,8 @@ Current state, pending work and the decision log. Commands: `README.md`. Design:
   GaterV3 checkpoints without the flash buffer load as channel attention (two released 1x models matched the original
   code exactly), GaterV3 gets resselt's upsamplers, SMoSR and GFISRv2 loader fixes; SMoSR, FIGSR and GFISRv2 checked
   against resselt, 245 variants exact; resselt's inference-only differences not adopted, its FIGSR border measured
-  4.8 dB worse at the edges). PyTorch tries
+  4.8 dB worse at the edges; c10, 2026-10-25: DUAL's context layers run neighborhood attention, bitwise vs
+  traiNNer's source on CPU FP32, 2x Light 690x512 fp16 68 -> 107 ms). PyTorch tries
   cuDNN attention first (2026-10-16: every model in
   fp16, not DUAL only; DUAL fp16 197.5 → 182.0 ms 1x, 52.0 → 47.0 ms 2x; Windows PyTorch has no Flash Attention).
   With the fp16 setting on, DUAL TensorRT exports start from fp16-rounded weights (68.5–88.6 dB vs exact, below the
@@ -612,27 +970,35 @@ Image cases, port against installed app, confirmation-run speedup at 32 / 8 CPUs
 
 | Item | Plan |
 | --- | --- |
-| Yes/no questions from the 2026-10-23 hunt (`native/local/hunt-20261023/REPORT.md`, "Your yes/no list"): (1) Save Video FFV1 `-level 3 -slices 16` (14-46 % faster saves, frames identical, bytes change; ruling 7); (2) Save Image PNG compression level 5 (-24 % save time, +0.7 % size); (3) Blue Noise non-identical speedup (prototype 8-19x, 6 of 65,536 ranks differ; ruling 11); (4) upscale run-ahead for PyTorch/ONNX/NCNN (branch `hunt/upscale-runahead`, needs a GPU check of a two-GPU-upscale chain) | The yes or no |
+| Yes/no questions from the 2026-10-23 hunt (`native/local/hunt-20261023/REPORT.md`, "Your yes/no list"): (1) Save Video FFV1 `-level 3 -slices 16` (14-46 % faster saves, frames identical, bytes change; ruling 7); (2) Save Image PNG compression level 5 (-24 % save time, +0.7 % size); (3) Blue Noise non-identical speedup (prototype 8-19x, 6 of 65,536 ranks differ; ruling 11); (4) upscale run-ahead: built 2026-10-29, removed 2026-10-30 (State) | The yes or no |
 | 2026-10-23 hunt GPU phase: merged upscale changes bit-identical on TensorRT fp16, PyTorch CUDA fp16 and NCNN Vulkan (TensorRT RGBA 4x -8 %); ONNX's CUDA provider did not start in a plain process ("Could not locate cublasLt64_12.dll", runtime CUDA 13) and the process ended silently | Check in the app: ONNX Upscale Image on CUDA |
 | Electron 43 checks still to make by hand: first start of the packaged zip, a folder dropped onto inputs, dropdown group headers, dialogs remembering the folder, screenshot copy, Squirrel install and uninstall. Passed by hand on 2026-10-24 from source: first start, a `.chn` and an image dropped, chain copy and paste, image paste, Get Native Resolution's values in Number/Text nodes, Linear Light. A start listens on a socket (Vite, Electron, the backend): new program paths raise a Firewall prompt | By hand, announced first (`native/local/getnative-20261023/electron-report.md`, "Start check") |
-| Electron 45: Electron 44 rebuilt the main-process clipboard (`readBuffer`, `writeBuffer`, `availableFormats`, `readHTML`, `readRTF`, `readImage`, `writeImage` removed); call sites `main-window.ts` (clipboard IPC), `clipboardImage.ts`, `copyAndPaste.ts`, `nodeScreenshot.ts`; also 44's `net.request` navigate-mode check and 45's sandboxed preloads | A clipboard migration with live tests (chain data byte-compatible with older chaiNNer, PNG screenshots, image paste's alpha rule) before Electron 43's end of life (January 2027) |
+| Electron 45 clipboard checks by hand (unit tests mock Electron's clipboard): chain copy and paste in the app, from v0.3.8 into it and from it into v0.3.8; image paste of an opaque and a transparent image (from a browser, which puts a PNG file on the clipboard, and from an app that puts only a bitmap); Export viewport to clipboard pasted into another app; `main.log` shows the backend's bare prints | By hand, at the next app start |
 | `Squirrel.exe` is missing from the portable zip: Forge 7.11 runs the makers concurrently, so the zip no longer picks up the copy electron-winstaller makes (inert in a portable package; `verify_independent_ui.cjs` expects none; the installer's nupkg has it) | Accept, or copy it in `postMake` (without the chaiNNer icon) |
 | Get Native Resolution's grid search at CRF 23 on x1.29 upscales: the planted 960x540 grid is supported on 0 of 288 frames (13 leading; supported frames sit on 930x523/930x540); at CRF 16, 98 of 288. Fractional plants vote 959x540 or 961x539 | A grid-core investigation (Vernier's search, not the kernel rule) |
 | Get Native Resolution's fold-ratio kernel fingerprint was set aside: its statistic carries 1/(1 + 1/SNR(f)), which varies across the band, so soft or compressed content looks like a softer kernel (2 wrong supported decisions at CRF 16); the code is in history (`e03c36e4`) | A noise-corrected estimator (a noise floor from the permuted coherence, or noise in the model) before another try |
-| Get Native Resolution follow-ups: the packet-index scan is not abortable (about 7 s cold on a 1.4 GB file, also for one typed time); `parameters.json`'s `selection` keeps Vernier's per-frame meaning on the Video tab; a video with a rotating display matrix refuses the light models; no Descaled output on the Video tab | Next session |
-| Backend video tests read the FFmpeg in `%APPDATA%\chaiNNer\backend-storage` and give Save Video that storage, so with the pinned FFmpeg a gate run with the real APPDATA would update that copy; tests that start the backend worker without a storage folder write `backend-storage\temp` under the real roaming folder (appdirs ignores the APPDATA variable) | A scratch storage fixture with the pinned FFmpeg, and `--storage-dir` for started workers; until then run the gate with APPDATA pointed at a scratch folder |
+| Get Native Resolution follow-ups: `parameters.json`'s `selection` keeps Vernier's per-frame meaning on the Video tab; no Descaled output on the Video tab | Next session |
 | Video written by Save Video through an FFmpeg 8.x or 9 build before the `setparams` fix (the D: install's FFmpeg 8 build included) has no primaries or transfer tags; FFmpeg 5.1.2 wrote them | Fixed for new saves; files already written keep their tags as written |
-| npm 11.19 (Node 24.22.1) skips the install scripts of `@swc/core`, `core-js-pure`, `electron-winstaller` and `esbuild` (none is needed) and warns on every install; the lock pins `@electron/node-gyp` from GitHub over `git+ssh`, so `npm ci` needs GitHub access | An `allowScripts` list; a registry `@electron/node-gyp` when Forge's rebuild has one |
-| 2026-10-23 hunt, found not fixed: Load Video on a truncated file ends early with success; Python executor does not wait for a lazy input on Stop; chains deeper than ~990 nodes hit the recursion limit (depth limit or iterative engine: to decide); ncnn `pow` with negative bases; NAFNet conversion KeyError; every node re-renders on edge changes; Denoise / Lens Blur SIMD rewrites; PNG encode is now the largest batch cost; editor speed-ups and the damaged-chain message need an in-app check | Next sessions |
+| npm 11.19 (Node 24.22.1) skips the install scripts of `@swc/core`, `core-js-pure`, `electron-winstaller` and `esbuild` (none is needed) and warns on every install; the lock pins `@electron/node-gyp` from GitHub over `git+ssh`, so `npm ci` needs GitHub access | `allowScripts` denies the four (2026-10-29); left: a registry `@electron/node-gyp` when Forge's rebuild has one |
+| 2026-10-23 hunt, found not fixed: Convert To NCNN's Power layers (integer powers other than 2, exact since the batch run) run on the CPU in a Vulkan net, one round trip each (ncnn has no Vulkan Power; square or multiply layers would keep small powers on the GPU); every node re-renders on edge changes; Denoise / Lens Blur SIMD rewrites; PNG encode is now the largest batch cost; editor speed-ups and the damaged-chain message need an in-app check | Next sessions |
 | Follow-on F01/F17: concurrent Skip Existing writers and concurrent settings writers | Still deferred by review. F11/F12 were subsequently approved and implemented in `3a345dee` |
 | Follow-on installed UI checks left: numeric drafts changed by stepper/arrow keys/wheel, and the backend stopping after an accepted quit | Typed numeric Ctrl+S and Quit-then-Cancel PASSED on the installed v0.3.8 (2026-10-22). Prescribed YUV/model, ONNX/NCNN Stop, background removal and the corrected Guided GPU run passed |
-| Python type check baseline: 30 errors and 44 warnings; test_video_io.py has an existing RUF005 lint warning | Unchanged baseline verified against d846db15; no unrelated repairs in this phase |
+| Ruff: `npm run lint:py` passes (`55583e78`); `ruff check` from `native\` reports 32 in tests and `tools/amd/bench.py` (I001 x7, Q000 x7 in `test_atomic_file.py`, B905 x4, PLW0108 x3, RUF005 x3 with test_video_io.py's, ISC004 x3, RUF043 x2, RUF001 x2, C408) | A lint pass |
 | Hunt O02: cold CFR Matroska/WebM rate detection and frame indexing read packets twice, then cache the result | Deferred unless a long cold load visibly stalls; preserve their different counting rules |
 | Hunt O03: opt-in `CHAINNER_C_TRT_RUNNER=1` retains both Python and C++ TensorRT engine copies | Parked: the cross-boundary ownership change is riskier than the current saving |
+| DUAL's PyTorch route 16 to 25 % faster with all 62 test outputs bit-identical (4x at 512x512: XS FP32 629 -> 516 ms, FP16 309 -> 239, BF16 307 -> 237; Light FP32 161 -> 135, FP16 87 -> 65, BF16 86 -> 67): local spandrel branch `dual-sync`, commit `a1e05b6`, worktree `spandrel-wt/dual-sync`. TensorRT had nothing to port (engines through this path: Light 15.25 ms, XS 56.33 ms) | Publish as spandrel c13 and pin it |
+| After the wave, run the store step inside its tiles (drops a second pool dispatch, works on cache lines just written); unmeasured | A probe with a keep rule |
+| The output range check (`normalized_output`, `cn_pixels_normalized_f32`) reads every image a node returns without `assume_normalized` once more: 3.6 ms at 3840x2160 RGB on the 9950X3D, about as long as Invert Color's whole pass. Such a node's kernel could report whether every value it wrote is in range, so the engine skips the read (same outputs) | When CPU chains are next sped up, after PNG decode and encode (65 % of the measured chain) |
+| GroupNorm on those small Dynamic ranges stays wrong in FP16, BF16 and Mixed (the written-out form reached 34 to 40 dB in forced FP16) | Find a form that holds in FP16, or refuse those builds |
+| DAT2 on a Dynamic engine is about 10 dB below Fixed (55.2 to 59.8 against 65.8 to 67.7 dB); cause not found | Look only if it shows in real use |
+| Nested ESRGAN engines lose LeakyReLU fusion (about 7 % of a 512x512 run, at most about 3 % to win back); `nestfold` and `nestdeconv` unmeasured | A probe with a keep rule |
+| Older ESRGAN ONNX files gain nesting only when converted again; a Build Engine pass would reach them but changes the engine cache key | Decide if asked |
+| Inline View Image still previews 2-plane images, where View Image (External) refuses them | Align them if it matters |
+| DUAL engines leave VRAM behind (2026-11-04, RTX 5090, TensorRT 11.4): the first DUAL engine loaded keeps 128 MiB in the process after it is freed (loading and freeing more stays flat; ESRGAN engines return to the baseline), and each DUAL engine that runs keeps about 2 MiB more (4 swap cycles of two engines: +16 MiB) | An investigation (TensorRT's AOT plugin kernels or its own kernel loading) if it matters |
 | Hunt GPU corrections B16-B18: owning-device reuse/teardown, low-headroom split admission, activation restore recovery | CPU/source checks only; real-device confirmation deferred in `GPU-DEFERRED.md` |
 | Load Video seek bar follow-ups (2026-10-21): the independent-UI patch (`native/tools/independent_ui.py`) for the `video-seek` input kind and runWithOverrides; the CLI path's Frame Count stays the probe's estimate (a run that reaches the end does not teach it); a one-frame run shares the Preview's decoded frame only in RGB float; VOSR Persistent Detail starts its history at a range's first context frame | Next sessions |
-| The error-retention fix's two recorded follow-ups, both INFERRED: a failed `/run/individual` (a preview's inputs) and the per-item errors of a non-fail-fast generator (`process.py:903` keeps `str(e)`; the run then fails, so B collects at its end). Each lets an exception through the same frames as a failed `/run`; A breaks their chaiNNer-C edge, and upstream's `Lazy` edge remains. One later commit (the final review) carries `await_owned_node`'s cancel-branch `error` local, which keeps a cycle if a node fails while a cancel waits. That is reachable, because Sanic cancels the handler when the UI drops `/run`; the fix is `del error` with a cancel-branch test. The same commit carries `owned_gather`'s `results`/`tasks` locals and two comment fixes in `server.py`. Upstream's `Lazy.from_coroutine` `completion` local needs a separate decision. Root cause: `native/reports/error-retention/rootcause.md` | The fix (2026-10-06) is two commits: A, `bad1dba7` (`await_owned_node` and `NodeFlights.run` drop their `future`/`task` locals), then B with D (`collect_failed_run`: one `gc.collect()` after a failed or stopped `/run`'s handler returns, then the pool's release if no run executes; ARCHITECTURE section 6). A failed run's arrays are freed right after it, earlier than upstream git's end of the next `/run`; successful runs never collect. Growth record: the release check (0)–(f), with (e) and (f) asserted; verdict `native/reports/error-retention/verdict.md`. REVIEW FLAG (decision log): `import gc` and that one collection; undo = `git revert` of the second commit. The B1 re-test and SP3b's phase-2 re-check follow it, then SP5a |
-| `lens_blur` builds its kernels on every call (B0's unused `_lens_plans` cache went in SP4b Task 3b); that cost is still not measured; SP3b did not take it up. SP3 follow-ups: bench cases for a resumed batch with skip-existing (a second run over the same output folder; harness) and for a heavy untaken Conditional branch; a K spot-check at 4 CPUs (affinity `0xF`); count the replay round trips, then skip the round trip when a replay has no concurrent sibling; compare folder identity in the read-ahead predicate (would close the loopback-alias and non-Windows case-insensitivity residuals). SP2 native-pool carry-overs, deferred (SP3 kept the pool unchanged): the spurious WakeAll on re-pin, the `leave` comment, the `cn_parallel_dispatches` non-Windows note, measuring whether dropping the generation bump in `leave` pays. Backend and test cleanups: dead `sequence` branch in `nodes/impl/native_layout.py:154-174` (Stack Images Sequence does not ship); `# pyright: ignore` in `nodes/impl/event_queue.py`; `native_analysis.is_grayscale` has no shipped caller (retire it or test it against numpy); split the 3605-line `native/tests/test_item_window.py` by concern (read-ahead predicate, engine and executor, Save phases, fresh interpreter) | SP4b, SP3b, SP3c and SP4c are closed (State). Order (2026-10-06): the error-retention fix (done, first row), then the B1 re-test and SP3b's phase-2 re-check, then SP5a (State, SP4c; rows below). A commit-path lever (B1 is re-tested after the error-retention fix) stays inside SP3c's boundary: outputs bit-identical to the installed chaiNNer and B3; file writes in item order, each complete before its node's finish event and before the next item's commit; events and `sse_contract` identical; the same error object, selected and surfaced at the same point relative to earlier and later items' side effects; Stop, pause and generator-once unchanged; K = 1 within noise. SP3 follow-ups and SP2 carry-overs: not yet scheduled (the SP4 attribution is done); cleanups SP4 or later |
+| The error-retention fix's two recorded follow-ups, both INFERRED: a failed `/run/individual` (a preview's inputs) and the per-item errors of a non-fail-fast generator (`process.py:903` keeps `str(e)`; the run then fails, so B collects at its end). Each lets an exception through the same frames as a failed `/run`; A breaks their chaiNNer-C edge, and upstream's `Lazy` edge remains. `await_owned_node`'s cancel-branch `error` local and `owned_gather`'s `results`/`tasks` locals are dropped since `8f220ab9`, with tests (checked 2026-10-29); the two `server.py` comments were rewritten since. Upstream's `Lazy.from_coroutine` `completion` local needs a separate decision. Root cause: `native/reports/error-retention/rootcause.md` | The fix (2026-10-06) is two commits: A, `bad1dba7` (`await_owned_node` and `NodeFlights.run` drop their `future`/`task` locals), then B with D (`collect_failed_run`: one `gc.collect()` after a failed or stopped `/run`'s handler returns, then the pool's release if no run executes; ARCHITECTURE section 6). A failed run's arrays are freed right after it, earlier than upstream git's end of the next `/run`; successful runs never collect. Growth record: the release check (0)–(f), with (e) and (f) asserted; verdict `native/reports/error-retention/verdict.md`. REVIEW FLAG (decision log): `import gc` and that one collection; undo = `git revert` of the second commit. The B1 re-test and SP3b's phase-2 re-check follow it, then SP5a |
+| `lens_blur` builds its kernels on every call (B0's unused `_lens_plans` cache went in SP4b Task 3b); that cost is still not measured; SP3b did not take it up. SP3 follow-ups: bench cases for a resumed batch with skip-existing (a second run over the same output folder; harness) and for a heavy untaken Conditional branch; a K spot-check at 4 CPUs (affinity `0xF`); count the replay round trips, then skip the round trip when a replay has no concurrent sibling; compare folder identity in the read-ahead predicate (would close the loopback-alias and non-Windows case-insensitivity residuals). SP2 native-pool carry-overs, deferred (SP3 kept the pool unchanged): the spurious WakeAll on re-pin, the `leave` comment, the `cn_parallel_dispatches` non-Windows note, measuring whether dropping the generation bump in `leave` pays. Test cleanup: split the 3605-line `native/tests/test_item_window.py` by concern (read-ahead predicate, engine and executor, Save phases, fresh interpreter) | SP4b, SP3b, SP3c and SP4c are closed (State). Order (2026-10-06): the error-retention fix (done, first row), then the B1 re-test and SP3b's phase-2 re-check, then SP5a (State, SP4c; rows below). A commit-path lever (B1 is re-tested after the error-retention fix) stays inside SP3c's boundary: outputs bit-identical to the installed chaiNNer and B3; file writes in item order, each complete before its node's finish event and before the next item's commit; events and `sse_contract` identical; the same error object, selected and surfaced at the same point relative to earlier and later items' side effects; Stop, pause and generator-once unchanged; K = 1 within noise. SP3 follow-ups and SP2 carry-overs: not yet scheduled (the SP4 attribution is done); cleanups SP4 or later |
 | SP4b parked levers, sizes in `native/reports/sp4/profile-final.md` section 7: output allocation (SP4c, done, State; first touch costs 0.15–0.20 µs per page, 88–117 µs per fresh 2.36 MB output; a 'clamped-by-us' registry mark would also skip the borrow's scan and freeze, 41–65 and 26–33 µs per output); resample horizontal SIMD (≈ 200 of ≈ 220 µs per call at 1 CPU, INFERRED); resample grain (720p: 13.6 of 31 wakes empty per call) and morphology grains (`cn_filter_morphology` runs 9 chunks per dispatch; Task 4b's line-grain variants were neutral or cost 30–35 % more CPU); `cn_filter_morphology`'s algorithm (2114 µs against ≤ 1400; erode ≈ 23× its serial bound); lens convolution grain (K = 1 per call 85.7 µs at Task 3c, ≈ 123 µs now, INFERRED from Task 3e's grain 16384; a count-dependent grain is the candidate); the commit path (SP3c, closed, State): 91–97 % of every image item, by measurement the largest lever on 6 of 10 image graphs, yet SP3c's probe confirmed no win | SP4c took output allocation (State); the others stay parked, chosen by measured size, each with its own paired A/B; phase 2's revival rule (State, SP3b) is applied at the re-profile after SP4c (the re-check follows the error-retention fix) |
 | SP5a-c (decision 2026-10-06, Consult 9): the product build is clang-cl 23.1.2 only, `-march=icelake-server` with ThinLTO and no PGO, `/fp:strict`, `/Brepro` (ARCHITECTURE section 3); MSVC and gcc left the build, and a startup check refuses a CPU below Ice Lake-SP / Zen 4. The A/B against MSVC was replaced by the switch. `isa_check.py`'s instruction-set checks (`objects`, `dll`) are retired, since every unit is Ice Lake-SP code and the ThinLTO objects are bitcode; its `text` comparison stays. Corrected 2026-10-07 : baseline x86-64 with runtime AVX2/AVX-512 dispatch, no CPU refusal, `-march` local-only (State) | The old-vs-new bench (CPython 3.11 + MSVC against 3.14 + clang) is the only timing; `-mprefer-vector-width=512` is an optional measured A/B after it; CCD affinity stays optional |
 | NaN-bit robustness (Consult 12 D-21): `cn_spectral_multiply` stays as is (equal to OpenCV 5.0.0 at every level; its NaN bits follow operand order). Any codegen-affecting toolchain or flag change (an LLVM bump, `-mprefer-vector-width=512`, PGO) re-runs `test_packed_spectrum_all_parities` and the NaN goldens (`test_golden_kernels` tail and dither, `test_forced_paths`) at all three `CHAINNER_C_ISA` levels; a failure is fixed in the integer shape of `normal_nan_outputs` (`color_shared.h`), never by a flag | Standing rule; SP5b (PGO) applies it before landing |
@@ -642,38 +1008,47 @@ Image cases, port against installed app, confirmation-run speedup at 32 / 8 CPUs
 | GPU-dependent work (the GPU lease and its unittest were removed on 2026-10-05, decision; `GPU-DEFERRED.md` item 2 retired). Item 1, the GPU provider paths, was verified by U4-light on 2026-10-07 and removed: NCNN on Vulkan, ONNX Runtime's CUDA execution provider and PyTorch CUDA work on the 3.14 stack (`default.chn` on the GPU included; peak per-process VRAM 1.87 GB); ONNX Runtime's DirectML and TensorRT providers were not exercised | `GPU-DEFERRED.md`, under the rule of 2026-10-07: no GPU benchmarks, at most 3 GB VRAM |
 | SP0 deferred follow-ups | `docs/superpowers/plans/2026-10-01-sp0-foundation.md`, "Deferred follow-ups" |
 | Upstream-parity items still listed (decision 4, 2026-10-04): the C1-class pins not yet checked against chaiNNer; lens power's input `maxss(+0, x)`, output-invisible and VERIFIED equal to chaiNNer's chain; compose's NaN selection, positions-level by rule (spec 4.4); suite-wide ±0-aware bitwise comparators (the suite's `assert_array_equal` treats ±0 as equal). Closed: the normalize/enforce clamp follows `np.clip` on the tested stack, −0 kept (ARCHITECTURE section 7, Consult 11 R-p) | SP5a, or the next task that touches them |
-| Upstream-bug follow-ups (2026-10-09): the bundled `chainner_pip` 23.2 downloads PEP 658 wheels twice (needs pip's pypa/pip#11847 fix in the bundled wheel); SCUNet ONNX export unblocking (needs a real-model test); the ONNX size probe cannot find multiples 12/24/48 and its lock serializes ONNX upscales during a probe; the host reads the worker's output as strict UTF-8 (`backslashreplace` on that Popen); the real first-start check needs a fixed, firewall-allowed folder | `the decision log` (D1-D15) |
+| Upstream-bug follow-ups (2026-10-09): SCUNet ONNX export unblocking (needs a real-model test); the real first-start check needs a fixed, firewall-allowed folder | `the decision log` (D1-D15) |
 | VOSR speed, PyTorch path: each window's DINO features go to the CPU and back, and every DiT prediction is synchronized and copied to the CPU (`vosr2_context.py`) | Keep them on the GPU when Default has room; paired A/B |
-| VOSR cold start: the 5.6 GB FP32 DiT checkpoint is converted to BF16 at every cold load (`vosr2.py`) | A cached BF16 copy; measure the cold start |
 | VOSR temporal on PyTorch: the next restoration does not overlap the CPU stabilization (about 1.1 s of 4.6 s per 2560×1440 frame); `stabilize` runs on one thread (1.0 s); the next `motion_pair` could run alongside | Paired A/B and a memory check for each |
 | VOSR temporal: each item settles its background restoration, so the GPU idles while downstream nodes (Save Video's encode) run | Decision: letting it cross the item boundary relaxes "no GPU work escapes an item" |
 | VOSR engine identities are broader than the engines: all of `vosr2.py` (a message edit rebuilds) and the whole plugin DLL (a metadata-only rebuild rebuilds) | Hash only engine-relevant code and the DLL's SASS/PTX |
-| VOSR engine sets of earlier identities (BF16, the prepared FP8 `f2d7a3da…`) are never removed: 1.7 to 3.5 GB each | A "remove unused VOSR caches" step |
-| VOSR engine builds: about 3 minutes without progress, one stage at a time, no timing cache | Stage count in the log; small stages in parallel; a per-GPU timing cache |
+| VOSR engine builds: one stage at a time, about 3 minutes (each stage's start and end and the total are logged; the per-GPU timing cache exists) | Small stages in parallel (a GPU check) |
 | VOSR FP8 and model downloads: one host each and no mirror | A mirror list beside the pins |
-| VOSR plugin release: nothing requires `vosr2_qkv.dll` in a release, and the package manifest does not record its TensorRT and CUDA versions | A release flag that requires it; versions in `native_toolchain` |
 | VOSR scene focus where a busy in-focus texture (thatch, foliage) holds the sharpest strip: in-focus faces count as partly defocused and lose 10-15 % detail (the issue-13 portrait, 2x). An edge-width reference (re-blur gradient ratio) fixed that frame but weakened Rin's defocused background at 4x. Separately, the half-soft face there was VOSR's own window seam (present with routing off), now handled by window placement and face windows (State). 2026-10-14: keep today's reference and the 64 px minimum window overlap (16 px measured: 8 % faster, 3x the seam step) | A focus measure tuned on more of the frames; seam windows for non-face content (anime faces, hands) need a trigger that finds them; faces wider than 800 px keep the layout's seams; in an output under 512 px on one side, a mirrored copy of an edge face in the padding can take a face window (harmless, rare) |
-| VOSR plugin code: no sm_90/sm_100 SASS (compute_120 PTX cannot run there); no header dependency file for the nvcc step; a dead branch in `qkv.cu` and an `rsqrtf` worth a comment | SASS when those GPUs become targets; `-MD -MF` with `DEPFILE`; code cleanups need GPU revalidation |
+| VOSR plugin code: no sm_90/sm_100 SASS (compute_120 PTX cannot run there); a dead branch in `qkv.cu` and an `rsqrtf` worth a comment | SASS when those GPUs become targets; code cleanups need GPU revalidation |
 | Look-ahead executor: K is decided at item 0 once a node looks ahead (a later-computed writer folder then forces K = 1 for groups reading per-item files); jobs computed ahead get a fresh context each; `ItemWindow._wake` rechecks every waiter; forced jobs bypass P; the UI's lineage takes the first iterated edge, the backend the first iterated input | A schema-level "looks ahead" flag, a per-node context cache, a per-slot waiter map and a cap, when a measured need appears |
 | VOSR in the local portable package: the nightly UI's patches lack the iterated condition | A patch JSON against the restored nightly (README, Prerequisites) |
-| VOSR temporal tests keep the removed generators verbatim as their oracle | Golden float32 outputs of a tiny clip |
 | Loop runs allocate about 60 MB more torch memory than one call (likely a cuBLAS workspace per pool thread) | Pin a GPU node's calls to one thread |
-| `tests/common/backend-nodes.test.ts` imports nodes with `error_on_failed_node=False`, so a node that fails to import disappears silently | Assert a few schema ids or import strictly |
-| `Build.ps1 -Configuration Debug` fails at `chainner_ext` (needs `python314_d.lib`, which the runtime lacks; pre-existing) | Skip `chainner_ext` in Debug or provide the debug library |
-| Upstream check and bug hunt (2026-10-16), queued items, each ruled by the review stand-in (`the decision log`, "2026-10-16 · Upstream check and bug hunt"): `independent_ui.py` patches for 17d9331c (uninstall a disabled package) and 3f671309 (hidden experimental toggle), with the nightly-restore item (first row); Electron logs backend stdout per chunk, so bare prints are missing from `main.log` (a line-based reader keeping every level); the read-ahead predicate refinement for look-ahead nodes (compute Save Image's folder nodes before the item-0 decision, compare the full output folder; Save Image's skipped-file CPU work also runs ahead); look-ahead jobs share the node's cleanup set (latent); Descale: a multi-reflect Mirror instead of the refusal, and a schema-range sweep for degenerate Blur/Taps (Blur 0.01 Bilinear gives black); PyAV CFR resampling for variable-rate MKV/WebM (today they use the CLI reader); VOSR engine-cache self-heal (move a corrupt cache aside, rebuild); pip resolves on every backend start (a lock-vs-installed check); lazy inputs: evaluate the producer inline on the waiting thread; untaken-branch outputs cached until run end; malformed `/run` error wording; Save Image: reject `..` (user-visible), RGBA to JPEG flatten vs drop (choice), AVIF 4:0:0 label, `nul` message; Riemersma History Length above about 487 M; ONNX int64-input message; Build Engine minimum 48 px; a newer-chaiNNer chain notice | Next sessions, in the order of the decisions file |
+| Upstream check and bug hunt (2026-10-16), queued items, each ruled by the review stand-in (`the decision log`, "2026-10-16 · Upstream check and bug hunt"): `independent_ui.py` patches for 17d9331c (uninstall a disabled package) and 3f671309 (hidden experimental toggle), with the nightly-restore item (first row); the read-ahead predicate refinement for look-ahead nodes (comparing the full output folder instead of Save Image's folder lets more chains read ahead: a ruling; Save Image's skipped-file CPU work also runs ahead); PyAV CFR resampling for variable-rate MKV/WebM (today they use the CLI reader); lazy inputs: evaluate the producer inline on the waiting thread; Save Image: RGBA to JPEG flatten vs drop (choice); a newer-chaiNNer chain notice | Next sessions, in the order of the decisions file |
 | Open questions (2026-10-16): vitest 1 -> 4 (with ip-address 9 -> 10 and adm-zip 0.5 -> 0.6), upstream #3318 (OOM recovery and tile-size display, a feature), re-release v0.3.4 with today's Descale Mirror out-of-bounds fix (v0.3.4 ships the bug), and the upstream features #3140/#3191/#3187/#3222 stay out | The yes or no |
-| VapourSynth hunt follow-ups (2026-10-16; the v0.3.5 re-release has the 21 hunt fixes plus 3; rulings by the review stand-in in `the decision log`): startup install of user modules outside the node import (the host waits 300 s for nodes, an install may take 900 s); vspipe in a job object so it ends with the worker (move `OwnedJob` to `nodes/impl/owned_job.py`, soft `assign`, vsview excluded); hide the ~36 base classes that always fail in Class dropdowns (scan hide list, vs-jetpack-version tagged) with MVTools methods needing analyze(), no-clip/tuple returns and object-only methods; `*args` clips; wrapped signatures (DFTTest.extract_freq, Morpho.black/white_hat); version pins in user_modules.toml; name a hanging user file in the scan timeout; uninstall removes transitive deps no other package needs (keep numpy, scipy and chaiNNer-C's own); uninstall KeyError; AI Upscale SAR with non-uniform ONNX scale; Preview Clips checks a temp copy before rewriting an open vsview's script; silent vsview start failure and per-worker viewers; `range` ints by sibling params; union inputs; FilePathType paths; per-plane expression lists; "*" file drag-and-drop (frontend). | Reports in the session scratchpad `vshunt\a1..a5-report.md`, rulings in the local rulings file |
+| VapourSynth hunt follow-ups (2026-10-16; the v0.3.5 re-release has the 21 hunt fixes plus 3; rulings by the review stand-in in `the decision log`; the process side closed 2026-10-29 on `batch-vsproc`): the catalog's hide table re-measured for a new vs-jetpack (the class sweep in `native/local/batch-20261029/lane-vscat/sweep`); frequency_merge gets one clip input (its other clip-or-number parameters keep Clip 2 to 8 away). | Reports in the session scratchpad `vshunt\a1..a5-report.md`, rulings in the local rulings file |
 | GPU phase of the YUV/TensorRT 11.4 work, the rest (approval only; ESRGAN models, DUAL Light/XS) | Phase 1 done 2026-10-18 (`native/local/yuv-planes/report-gpu.md`: runner tests, Upscale Image and AI Upscale bit-identical, 11.2 vs 11.4, bridge vs runner vs vstrt, the 11.2-engine message; Tile documented, not honoured). Left: AI Upscale's runner default on a 1080p RGBS testsrc2 clip, Streams 1 and 2, against the bridge (`CHAINNER_C_TRT_RUNNER=0`) with one ESRGAN engine, headless, 50 frames after warm-up: frames bit-identical, ms/frame each; vosr2_qkv and DUAL on 11.4 |
 | GPU checks deferred on 2026-10-16 (a model was training; light checks only): Build Engine Fixed 64x64 -> Get Engine Info -> Upscale on 200x150 under chaiNNer-C's TensorRT 11.2; a fixed-size ONNX engine keeps its size under 11.2; the timing cache file after the first build and "Loaded" on the second; Stop and worker kill during a real DUAL build (no child left, VRAM back); the TensorRT session-leak paths (need a CUDA fault); the VOSR CUDA checks listed in the area-7 hunt report | The next GPU session |
 | instant-exec, deferred by ruling (2026-10-19): Save Video adds audio in the encode pass, dropping the second full pass (R5b); Clip Frames evaluates its script twice (a sidecar from the frames run's evaluation); Normal Map Generator native only with a native FFT, no partial port (R9); an optional row stride in the image ABI (a partial-width crop copies today where Python returned a view); Load Images as a native `ItemSource`, only if `resize-real-256` shows at least 0.1 ms per item of GIL-held glue; zlib-ng inflate for PNG and TIFF decode (read side only); the Python executor and its white-box tests retired in the first release after v0.3.7 whose full gate passes with the native default (A5) | Next sessions, each with its paired measurement; GPU items: `GPU-DEFERRED.md` rows 6-22 |
-| instant-exec residuals (the lane reports' open lists, `native/local/instant-exec/report-*.md`). Engine: 16 concurrent previews 20 ms against Python's 9; a fault outside a node names no node; a context node computed ahead runs its cleanups at once (outputs equal); no memo for native generators' items; the memo counts a storage an item and its crop share twice (errs safe); a file changed between stat and decode can hit a stale entry (a same-size rewrite is seen by its change time); latent: `decide()` takes a slot after the GIL, paused time while the driver blocks outside `suspend()`; engine images are always C-contiguous (P7: the reference); `engine_differential.py` builds a chain per executor, so side-effect order across sinks is not compared exactly. Startup: the first launch after an update shows the splash once; fresh storage compiles PyMatting (about 25 s, delaying its two nodes and the full list); Run is inert until the backend takes requests (about 1 s). Nodes: a Seed through Pass Through is an equal new object; above 2^63 bytes NumPy raises ValueError where the engine raises MemoryError or OverflowError (per-node decision). Codecs: non-plain TIFF Load Image and GIF/TGA/AVIF/DDS Save Image still decline; `JSIMD_FORCENONE` changes our libjpeg-turbo, not OpenCV's (one CMYK JPEG-in-TIFF); the writer's cross-drive move is untested; `.exr` still fails (open questions). Upscale: the size probe's disk cache and background probe at Load Model; `recover_alpha` per chunk; output-changing TensorRT balanced tiles and PyTorch tile batching (decision). App: pip's `~` folders and FFmpeg's `.part`/`.tmp` crash leftovers are not swept; a backend crash's `app.exit(1)` skips the settings flush; `useSettings` subscribes to the whole object; a layout-only counter, an incremental type pass and preview reuse on reopen (skipped: small gain). Video: a fused float BGR -> 16-bit planes kernel; `chainner_vs/upscale.py` `_image` still `np.stack`s; no native PyAV reader (Save Video sets the pace). Models: `size_probe.py` could use `model_facts`; the probe and the build cache hash the same bytes twice; Interpolate Models and auto_split mutate shared models; two concurrent first uses of an ONNX session make two sessions. Backend: `file_sequence.cpp` resolves every folder (`realpath`; a 1000x5 tree 227 ms against 105 ms with `scandir`) unless the second wave's listing work covers it; dead code: `server.py`'s `/packages` builds a dependency list it discards. Final wave: an 8.3 short target name is no longer expanded by the atomic writer; a module that fails on every start for a reason other than a missing dependency never writes the UI cache (that start shows the splash, as before); `gc.freeze` is skipped when a framework node's preview finished first (the template), so R1's gain is for starts without one; the native codecs read OpenCV's limit variables as plain integers only; two Convert To ONNX nodes with different options on one model re-export on each run; the size probe re-probes a model that does not run on each load | Next sessions, by measured size |
+| instant-exec residuals (the lane reports' open lists, `native/local/instant-exec/report-*.md`). Engine: 16 concurrent previews 20 ms against Python's 9; no memo for native generators' items; the memo counts a storage an item and its crop share twice (errs safe); a file changed between stat and decode can hit a stale entry (a same-size rewrite is seen by its change time); latent: `decide()` takes a slot after the GIL, paused time while the driver blocks outside `suspend()`; engine images are always C-contiguous (P7: the reference); `engine_differential.py` builds a chain per executor, so side-effect order across sinks is not compared exactly. Startup: the first launch after an update shows the splash once; fresh storage compiles PyMatting (about 25 s, delaying its two nodes and the full list); Run is inert until the backend takes requests (about 1 s). Nodes: a Seed through Pass Through is an equal new object; above 2^63 bytes NumPy raises ValueError where the engine raises MemoryError or OverflowError (per-node decision). Codecs: non-plain TIFF Load Image and GIF/TGA/AVIF/DDS Save Image still decline; `JSIMD_FORCENONE` changes our libjpeg-turbo, not OpenCV's (one CMYK JPEG-in-TIFF); the writer's cross-drive move is untested; `.exr` still fails (open questions). Upscale: the size probe's disk cache and background probe at Load Model; `recover_alpha` per chunk; output-changing TensorRT balanced tiles and PyTorch tile batching (decision). App: `useSettings` subscribes to the whole object; a layout-only counter, an incremental type pass and preview reuse on reopen (skipped: small gain). Video: a fused float BGR -> 16-bit planes kernel; `chainner_vs/upscale.py` `_image` still `np.stack`s; no native PyAV reader (Save Video sets the pace). Models: `size_probe.py` could use `model_facts`; the probe and the build cache hash the same bytes twice. Backend: `file_sequence.cpp` resolves every folder (`realpath`; a 1000x5 tree 227 ms against 105 ms with `scandir`) unless the second wave's listing work covers it. Final wave: `gc.freeze` is skipped when a framework node's preview finished first (the template), so R1's gain is for starts without one; the native codecs read OpenCV's limit variables as plain integers only; two Convert To ONNX nodes with different options on one model re-export on each run | Next sessions, by measured size |
 | Open questions (instant-exec, 2026-10-19; the local queue file): release v0.3.7 (tag, push, D: update)? The native engine becomes every user's default executor; the Python one stays reachable by `CHAINNER_C_EXECUTOR=python` until its retirement. FFV1 `-level 3 -slices 16` for Frames to Clip's internal lossless temp? That node 2.7x faster, temp bytes change, one named exception to the codec rule (R6). Build Engine's disk Engine Cache on by default? Up to 16 GiB of engines in the storage folder. A pip wheel cache for dependency installs (multi-GB, the disk rule). The memo cache as a user setting. The `.exr` loading fix (OpenCV's build has no OpenEXR). The spandrel fork wheel release with the DRFT fold speed-up (build 309 -> 210 ms). The Python executor's retirement in the first release after v0.3.7 (A5). Checks: the image size limit as read (40,000 x 40,000 = 1.6 billion pixels in total, each side up to 1,048,576); clicking a node selects it on mouse-up (was mouse-down); the packaged `out\` startup timing (one launch; a new folder may prompt the firewall); the GPU checks, `GPU-DEFERRED.md` rows 6-22 | The yes or no |
-| VRAM after Stop follow-ups (2026-10-19): on `CHAINNER_C_EXECUTOR=python` a dropped /run's node that ends after the request keeps its memory reserved (collect_failed_run ran before it ended: 18 GB held 25 s in the probe) | Release after the node's end on the Python executor |
-| DRFT TensorRT route (2026-10-20): released (re-release 5, State); the ONNX size probe logs four tracebacks for any plugin ONNX (DUAL's too; the load is unaffected); Convert To NCNN still takes a legacy DRFT through the generic export (wrong at sizes other than 32x32) | On request |
+| DRFT TensorRT route (2026-10-20): released (re-release 5, State); nothing open | On request |
 | VRAM offload follow-ups (2026-10-20): a first overflow in a session pays the page-locking of its pinned RAM (2176 px: 5.96 s against 4.95 s warm), again in each run that overflows (its pinned RAM is released at the run's end); least-recently-used order brings 6.8 GiB back where a traced farthest-next-use plan would bring almost none; only Upscale Image's forward is covered (inputs of 2 MP or more) | A traced plan if the warm 7 % matters |
 
 ## Decision log
 
+- 2026-10-29 (DDS on Linux, stand-in ruling): a texconv lookalike on DirectXTex (native/texconv) instead of the
+  error; texconv.exe's output is the reference, and what Windows decides in WIC or MSVC's arithmetic is rebuilt where
+  measured exactly, otherwise listed (`linux_differences.json`, `texconv-wic-*`). Records:
+  `native/local/prep-20261029/lane-dds/`.
+- 2026-10-29 (Linux x86-64): Windows code stays verbatim and Linux code goes in `#else` / `if(NOT WIN32)` blocks and
+  `native/toolchain-linux.cmake`; the glibc 2.28 floor comes from a Rocky 8.10 sysroot inside an Ubuntu 22.04 image;
+  C-library math follows the system's libm (Linux twins of the golden manifests) except `sqrt` and `sqrtf`, which
+  reproduce the static UCRT; Linux workers switch off NumPy's AVX-512 dispatch; DDS keeps its error and the zip carries
+  no texconv; VapourSynth is unavailable below glibc 2.35; NCNN defaults to the CPU when every Vulkan device is
+  software; Copy To Clipboard calls wl-clipboard or xclip; the sandbox is probed and `CHAINNER_SANDBOX` overrides it; no
+  separate Linux release, the zips ship with the next one. Records: `native/local/linux-20261029/` (decisions.md).
+- 2026-10-25 (DUAL neighborhood attention, owner handoff): every DUAL model runs it in both routes with no switch back
+  (weights carry no routing); non-RFB or cosine variants keep their windows; a fixed export whose trunk fits both
+  windows keeps the whole-window ops (the source's dispatch), dynamic exports always use the NA kernel; ONNX files
+  exported before still build, with a log warning; GPU tests at the research input 512x692 (owner); the remaining
+  0.9 % to the research engine (its NA plugin layers) parked. Records: `native/local/dual-na-20261025/decisions.md`.
 - 2026-10-24 (resselt's GaterV3, SMoSR, FIGSR and GFISRv2): spandrel loads every checkpoint resselt's versions make,
   but keeps its own inference behaviour where it is better or is the trainers' (FIGSR without resselt's 4 px border,
   GFISRv2's even-size padding); GFISR v1 and MoSRv2 not added; shipped with the allocator fix as one re-release.

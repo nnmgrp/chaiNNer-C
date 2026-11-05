@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import inspect
+import os
 import subprocess
 import threading
 import time
@@ -17,9 +18,12 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import onnxruntime as ort
 import pytest
+import torch
 from spandrel import ImageModelDescriptor
 
+import gpu
 from api import NodeContext, SettingsParser
 from gpu import cuda_pci_addresses
 from nodes.impl.onnx.model import OnnxGeneric, OnnxInfo
@@ -61,11 +65,11 @@ pytest.importorskip("nodes.impl._chainner_graph")
 chainner_vs = importlib.import_module("nodes.impl.vapoursynth.chainner_vs")
 bridge = importlib.import_module("nodes.impl.vapoursynth.chainner_vs.upscale")
 
-# A 2x ESRGAN (7 MB) and a 4x Compact ONNX (2.5 MB) from the local model folder.
-ESRGAN_2X = Path(r"C:\Executables\models\ESRGAN\2x_Waifaux-NL3-SuperLite_latest_G.pth")
-COMPACT_4X_ONNX = Path(
-    r"C:\Executables\models\ESRGAN\4xLSDIRCompactN-fp32-opset17.onnx"
-)
+# A 2x ESRGAN (7 MB) and a 4x Compact ONNX (2.5 MB) from the local model folder
+# (CHAINNER_C_TEST_MODELS on a machine where it is elsewhere).
+MODELS = Path(os.environ.get("CHAINNER_C_TEST_MODELS", r"C:\Executables\models\ESRGAN"))
+ESRGAN_2X = MODELS / "2x_Waifaux-NL3-SuperLite_latest_G.pth"
+COMPACT_4X_ONNX = MODELS / "4xLSDIRCompactN-fp32-opset17.onnx"
 
 pytestmark = pytest.mark.skipif(
     not ESRGAN_2X.is_file(), reason=f"{ESRGAN_2X} is not on this machine"
@@ -128,16 +132,34 @@ class Context:
     def suspend(self) -> None:
         pass
 
+    def set_progress(self, progress: float) -> None:
+        pass
+
 
 def gpu_visible() -> bool:
     return bool(cuda_pci_addresses())
 
 
-def pytorch_reference(imgs: list[np.ndarray], tile_size: TileSize, custom: int):
+def pytorch_reference(
+    imgs: list[np.ndarray],
+    tile_size: TileSize,
+    custom: int,
+    use_cpu: bool | None = None,
+):
     """PyTorch's Upscale Image node on `imgs`, on the bridge's device (chaiNNer's CPU
-    mode when CUDA sees no GPU)."""
+    mode when CUDA sees no GPU), or on the GPU or the CPU as `use_cpu` says."""
+    if use_cpu is None:
+        use_cpu = not gpu_visible()
+    # The bridge's GPU: CUDA's first, or the strongest AMD GPU where there is no NVIDIA
     context = cast(
-        NodeContext, Context({"use_cpu": not gpu_visible(), "use_fp16": False})
+        NodeContext,
+        Context(
+            {
+                "use_cpu": use_cpu,
+                "use_fp16": False,
+                "gpu_index": str(bridge.gpu_index()),
+            }
+        ),
     )
     model = load_pytorch_model_node(context, ESRGAN_2X)[0]
     assert isinstance(model, ImageModelDescriptor)
@@ -196,6 +218,63 @@ def test_onnx_bridge_matches_upscale_node():
         assert np.array_equal(image_of(out.get_frame(n)), want)
 
 
+@pytest.mark.amd_gpu
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(),
+    reason="needs an AMD GPU and a ROCm build of PyTorch",
+)
+def test_bridge_runs_pytorch_on_an_amd_gpu(monkeypatch: pytest.MonkeyPatch):
+    # ROCm's PyTorch takes HIP's devices as CUDA's: the bridge runs on the first.
+    monkeypatch.setattr(bridge, "loaded", {})
+    imgs = images(2)
+    expected = pytorch_reference(imgs, ESTIMATE, 0, use_cpu=False)
+
+    out = chainner_vs.upscale(
+        clip_of(imgs), str(ESRGAN_2X), "PyTorch", "fp32", ESTIMATE
+    )
+
+    for n, want in enumerate(expected):
+        np.testing.assert_allclose(image_of(out.get_frame(n)), want, rtol=0, atol=1e-5)
+
+
+@pytest.mark.amd_gpu
+@pytest.mark.skipif(not COMPACT_4X_ONNX.is_file(), reason="no ONNX test model")
+@pytest.mark.skipif(
+    "MIGraphXExecutionProvider" not in ort.get_available_providers()
+    or not gpu.amd.is_available,
+    reason="needs an AMD GPU and ONNX Runtime's MIGraphX provider",
+)
+def test_bridge_runs_onnx_on_migraphx(monkeypatch: pytest.MonkeyPatch):
+    from packages.chaiNNer_onnx.settings import default_provider
+
+    assert default_provider == "MIGraphXExecutionProvider"
+    monkeypatch.setattr(bridge, "loaded", {})
+    imgs = images(2)
+    # The node in the bridge's settings: MIGraphX in FP32, without the program cache
+    context = cast(
+        NodeContext,
+        Context(
+            {
+                "execution_provider": default_provider,
+                "gpu_index": str(gpu.amd.default_index),
+            }
+        ),
+    )
+    model = load_onnx_model_node(COMPACT_4X_ONNX)[0]
+    assert isinstance(model, OnnxGeneric)
+    expected = [
+        onnx_upscale_image_node(context, img, model, TILE_SIZE_256, 0, False)
+        for img in imgs
+    ]
+
+    out = chainner_vs.upscale(
+        clip_of(imgs), str(COMPACT_4X_ONNX), "ONNX", "fp32", ESTIMATE
+    )
+
+    for n, want in enumerate(expected):
+        np.testing.assert_allclose(image_of(out.get_frame(n)), want, rtol=0, atol=1e-4)
+
+
 def test_gray_clip_roundtrip():
     imgs = images(3, gray=True)
     expected = pytorch_reference(imgs, ESTIMATE, 0)
@@ -229,20 +308,28 @@ def test_out_of_range_input_is_clipped_like_the_node():
 
 
 def fake_load(
-    monkeypatch: pytest.MonkeyPatch, input_channels: int, output_channels: int
+    monkeypatch: pytest.MonkeyPatch,
+    input_channels: int,
+    output_channels: int,
+    scale_width: int = 2,
+    scale_height: int = 2,
 ) -> None:
-    """Every model loads as a 2x upscaler with these channel counts that makes black
-    images."""
+    """Every model loads as an upscaler with these channel counts and scales (2x by
+    default) that makes black images."""
 
     def run(img: np.ndarray, tile: int) -> np.ndarray:
         h, w = img.shape[:2]
-        return np.zeros((2 * h, 2 * w, output_channels), np.float32)
+        return np.zeros(
+            (scale_height * h, scale_width * w, output_channels), np.float32
+        )
 
     monkeypatch.setattr(bridge, "loaded", {})
     monkeypatch.setattr(
         bridge,
         "load",
-        lambda *key: bridge.Upscaler(2, 2, input_channels, output_channels, run),
+        lambda *key: bridge.Upscaler(
+            scale_width, scale_height, input_channels, output_channels, run
+        ),
     )
 
 
@@ -266,6 +353,45 @@ def test_colour_props_follow_a_colour_family_change(monkeypatch: pytest.MonkeyPa
     assert "_Matrix" not in frame.props
     assert frame.props["Marker"] == 7
     gray_out.resize.Bicubic(format=vs.RGBS).get_frame(0)
+
+
+def test_sar_follows_a_model_that_scales_width_and_height_differently(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An ONNX model may scale width and height differently: the pixels then change
+    their shape, and the sample aspect ratio with them (times height/width scale), so
+    that the picture keeps its shape on screen."""
+    # The fake loader stands in for such a model (the file only has to exist).
+    fake_load(monkeypatch, 3, 3, scale_width=2, scale_height=1)
+    clip = clip_of(images(1))
+    for props, sar in (
+        ({"_SARNum": 4, "_SARDen": 3}, (2, 3)),
+        ({}, (1, 2)),  # square pixels
+        ({"_SARNum": 0, "_SARDen": 1}, (0, 1)),  # unknown stays unknown
+    ):
+        out = chainner_vs.upscale(
+            clip.std.SetFrameProps(**props), str(ESRGAN_2X), "PyTorch", "fp32", 0
+        )
+        frame = out.get_frame(0)
+        assert (out.width, out.height) == (2 * WIDTH, HEIGHT)
+        assert (frame.props["_SARNum"], frame.props["_SARDen"]) == sar
+    # A model that scales both alike keeps the SAR, or its absence.
+    fake_load(monkeypatch, 3, 3)
+    out = chainner_vs.upscale(
+        clip.std.SetFrameProps(_SARNum=4, _SARDen=3),
+        str(ESRGAN_2X),
+        "PyTorch",
+        "fp32",
+        0,
+    )
+    frame = out.get_frame(0)
+    assert (frame.props["_SARNum"], frame.props["_SARDen"]) == (4, 3)
+    assert (
+        "_SARNum"
+        not in chainner_vs.upscale(clip, str(ESRGAN_2X), "PyTorch", "fp32", 0)
+        .get_frame(0)
+        .props
+    )
 
 
 @pytest.mark.parametrize("build", ["runner", "switched off", "no plugin"])
@@ -304,6 +430,60 @@ def test_tensorrt_runs_on_the_runner_unless_switched_off_or_missing(
     else:
         assert calls == []
         assert (out.width, out.height) == (2 * WIDTH, 2 * HEIGHT)
+        out.get_frame(0)
+
+
+def test_an_engine_the_runner_refuses_runs_on_the_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    runner_module = importlib.import_module("nodes.impl.tensorrt.runner")
+    engine = tmp_path / "model.engine"
+    engine.write_bytes(b"")
+    monkeypatch.setattr(runner_module, "runner_plugin", lambda: tmp_path / "plugin")
+
+    def runner_clip(clip: Any, model: str, plugin: Path, streams: int) -> Any:
+        raise vs.Error(
+            "Upscale: The TensorRT runner takes engines with 1 or 3 input and output"
+            " channels, not 4 -> 4."
+        )
+
+    monkeypatch.setattr(bridge, "_runner_clip", runner_clip)
+    fake_load(monkeypatch, 4, 4)
+    out = chainner_vs.upscale(clip_of(images(1)), str(engine), "TensorRT", "fp32", 0, 1)
+    assert (out.width, out.height) == (2 * WIDTH, 2 * HEIGHT)
+
+
+def test_the_runners_other_refusals_reach_the_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    runner_module = importlib.import_module("nodes.impl.tensorrt.runner")
+    engine = tmp_path / "model.engine"
+    engine.write_bytes(b"")
+    monkeypatch.setattr(runner_module, "runner_plugin", lambda: tmp_path / "plugin")
+
+    def runner_clip(clip: Any, model: str, plugin: Path, streams: int) -> Any:
+        raise vs.Error("Upscale: The TensorRT engine is empty.")
+
+    monkeypatch.setattr(bridge, "_runner_clip", runner_clip)
+    with pytest.raises(vs.Error, match="engine is empty"):
+        chainner_vs.upscale(clip_of(images(1)), str(engine), "TensorRT", "fp32", 0, 1)
+
+
+def test_a_model_making_more_planes_than_its_file_says_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    # An ONNX can leave its output channels unnamed, which reads as 3.
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"")
+
+    def run(img: np.ndarray, tile: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        return np.zeros((2 * h, 2 * w, 5), np.float32)
+
+    monkeypatch.setattr(bridge, "loaded", {})
+    monkeypatch.setattr(bridge, "load", lambda *key: bridge.Upscaler(2, 2, 3, 3, run))
+    out = chainner_vs.upscale(clip_of(images(1)), str(model), "ONNX", "fp32", 0)
+    with pytest.raises(vs.Error, match="5-channel image"):
         out.get_frame(0)
 
 

@@ -80,6 +80,14 @@ def upscale_with_session(
 ) -> np.ndarray:
     """The node's upscale of one image with the model's session (also used by
     VapourSynth's AI Upscale, which has no node context)."""
+    input_type = session.get_inputs()[0].type
+    if input_type not in ("tensor(float)", "tensor(float16)"):
+        raise ValueError(
+            f"This ONNX model's input is a {input_type}, but Upscale Image gives a"
+            " model its image as a tensor(float), or a tensor(float16) to an FP16"
+            " model. Use a model that takes an image of floats, such as one from"
+            " Convert To ONNX."
+        )
     input_shape, in_nc, req_width, req_height = get_input_shape(session)
     _, out_nc, _, _ = get_output_shape(session)
     change_shape = input_shape == "BHWC"
@@ -155,6 +163,9 @@ def upscale_image_node(
         settings.execution_provider,
         settings.tensorrt_fp16_mode,
         settings.tensorrt_cache_path,
+        settings.migraphx_fp16_mode,
+        settings.migraphx_cache_path,
+        settings.migraphx_exhaustive_tune,
     )
     return upscale_with_session(
         img,

@@ -10,6 +10,7 @@ TensorRT) are imported when a script first loads a model of that backend."""
 from __future__ import annotations
 
 import importlib
+import math
 import os
 import threading
 from collections.abc import Callable
@@ -32,8 +33,17 @@ BACKENDS: dict[str, tuple[str, ...]] = {
 }
 PRECISIONS = ("fp32", "fp16")
 
-# chaiNNer's default GPU setting: the first CUDA device.
+# chaiNNer's default GPU setting for TensorRT: the first CUDA device.
 GPU_INDEX = 0
+
+
+def gpu_index() -> int:
+    """chaiNNer's default GPU setting for PyTorch and ONNX: CUDA's first device; where
+    no NVIDIA GPU is detected, HIP's strongest AMD GPU (a Ryzen's graphics often come
+    first in HIP's order), which PyTorch on ROCm and MIGraphX take."""
+    from gpu import amd, nvidia
+
+    return amd.default_index if amd.is_available and not nvidia.is_available else 0
 
 
 @dataclass(frozen=True)
@@ -73,11 +83,12 @@ def _pytorch(path: str, precision: str) -> Upscaler:
     )
     from packages.chaiNNer_pytorch.settings import PyTorchSettings
 
-    # chaiNNer's CPU mode when CUDA has no GPU (FP16 then falls back to FP32).
+    # chaiNNer's CPU mode when CUDA (HIP in a ROCm build of PyTorch) has no GPU
+    # (FP16 then falls back to FP32).
     settings = PyTorchSettings(
         use_cpu=not torch.cuda.is_available(),
         use_fp16=precision == "fp16",
-        gpu_index=GPU_INDEX,
+        gpu_index=gpu_index(),
         budget_limit=0,
     )
     model = load_model(Path(path), settings)
@@ -120,7 +131,7 @@ def _onnx(path: str) -> Upscaler:
     from packages.chaiNNer_onnx.onnx.processing.upscale_image import (
         upscale_with_session,
     )
-    from packages.chaiNNer_onnx.settings import default_provider
+    from packages.chaiNNer_onnx.settings import default_provider, provider_device
 
     model = load_model_node(Path(path))[0]
     if not isinstance(model, OnnxGeneric):
@@ -134,11 +145,16 @@ def _onnx(path: str) -> Upscaler:
             f"chaiNNer cannot tell the scale of {Path(path).name}, so AI Upscale"
             " cannot size its clip."
         )
-    # chaiNNer's default execution provider; the CPU when CUDA has no GPU.
+    # chaiNNer's default execution provider (MIGraphX only where there is an AMD
+    # GPU, DirectML on Windows there), on the device it numbers the GPU by; the CPU
+    # when CUDA has no GPU. MIGraphX runs the model in its own precision, without the
+    # ONNX settings' program cache.
     provider = default_provider
     if provider == "CUDAExecutionProvider" and not cuda_pci_addresses():
         provider = "CPUExecutionProvider"
-    session = get_onnx_session(model, GPU_INDEX, provider, False)
+    session = get_onnx_session(
+        model, provider_device(provider, gpu_index()), provider, False
+    )
 
     def run(img: np.ndarray, tile: int) -> np.ndarray:
         # ONNX has no tile estimate: Auto is the ONNX node's default tile size.
@@ -271,8 +287,28 @@ def _write(img: np.ndarray, frame: Any) -> None:
     if frame.format.num_planes == 1:
         np.copyto(np.asarray(frame[0]), img.reshape(height, width))
         return
+    if img.ndim != 3 or img.shape[2] != 3:
+        channels = 1 if img.ndim == 2 else img.shape[2]
+        raise RuntimeError(
+            f"The model made a {channels}-channel image where AI Upscale expected RGB."
+        )
     for plane, channel in enumerate((2, 1, 0)):
         np.copyto(np.asarray(frame[plane]), img[:, :, channel])
+
+
+def _stretch_sar(props: Any, scale_width: int, scale_height: int) -> None:
+    """The sample aspect ratio of a frame scaled by these factors, so that it keeps its
+    shape on screen: _SARNum/_SARDen times scale_height/scale_width, reduced. A frame
+    without them has square pixels (1/1); one whose SAR is unknown (0) keeps it."""
+    num = props.get("_SARNum", 1)
+    den = props.get("_SARDen", 1)
+    if num <= 0 or den <= 0:
+        return
+    num *= scale_height
+    den *= scale_width
+    divisor = math.gcd(num, den)
+    props["_SARNum"] = num // divisor
+    props["_SARDen"] = den // divisor
 
 
 def _runner_clip(clip: Any, model: str, plugin: Path, streams: int) -> Any:
@@ -311,7 +347,8 @@ def upscale(
     float clip need not be), so a frame comes out as the Upscale Image node makes it
     from the clipped image. Frame properties carry over; when the model changes the
     colour family (a 1 -> 3 or 3 -> 1 channel model), _Matrix becomes the new family's:
-    0 (RGB) on an RGB result, none on a gray one."""
+    0 (RGB) on an RGB result, none on a gray one; when it scales width and height
+    differently (an ONNX model can), _SARNum/_SARDen change with it (_stretch_sar)."""
     fmt = clip.format
     if fmt.id not in (vs.RGBS, vs.GRAYS):
         # A clip whose format varies has the format id 0 (named "None").
@@ -338,7 +375,12 @@ def upscale(
         plugin = runner_plugin()
         if plugin is not None:
             _model_key(model, backend, precision)
-            return _runner_clip(clip, model, plugin, streams)
+            try:
+                return _runner_clip(clip, model, plugin, streams)
+            except vs.Error as error:
+                # The runner takes engines of 1 or 3 channels; the bridge takes the rest.
+                if "input and output channels" not in str(error):
+                    raise
     upscaler = _upscaler(model, backend, precision)
     # As the Upscale Image nodes: the clip's channels, unless the model changes them
     # (a gray clip goes through an RGB model as BGR and comes back as gray).
@@ -359,6 +401,7 @@ def upscale(
     core = vs.core
     # A YUV _Matrix on an RGB clip, or RGB's on a gray one, fails the next resize.
     family_changed = out.format.color_family != fmt.color_family
+    stretched = upscaler.scale_width != upscaler.scale_height
 
     def frame(n: int, f: Any) -> Any:
         img = _image(f)  # a copy of the frame's planes, clipped in place
@@ -373,6 +416,8 @@ def upscale(
                 dst.props["_Matrix"] = 0
             else:
                 dst.props.pop("_Matrix", None)
+        if stretched:
+            _stretch_sar(dst.props, upscaler.scale_width, upscaler.scale_height)
         return dst
 
     upscaled_clip = out.std.ModifyFrame(clips=clip, selector=frame)

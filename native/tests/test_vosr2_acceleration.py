@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 from typing import cast
 
@@ -138,14 +139,17 @@ def test_cached_coordinates_are_immutable_bounded_and_preserve_warp():
     assert coordinates.cache_info().currsize == 2
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="a Windows job object, its suspended start, and files a process holds open",
+)
 def test_compiler_job_releases_descendant_file_handles_before_cleanup(tmp_path):
     import subprocess
-    import sys
     import time
 
     import psutil
 
-    from nodes.impl.pytorch.vosr2_process import OwnedJob
+    from nodes.impl.owned_job import OwnedJob
 
     held = tmp_path / "compiler.log"
     ready = tmp_path / "child-ready"
@@ -180,6 +184,46 @@ def test_compiler_job_releases_descendant_file_handles_before_cleanup(tmp_path):
             process.wait(timeout=10)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="the job is a Linux process group")
+def test_compiler_job_ends_the_compiler_and_its_descendants(tmp_path):
+    import subprocess
+    import time
+
+    import psutil
+
+    from nodes.impl.owned_job import OwnedJob
+
+    started = tmp_path / "descendant.pid"
+    child_code = (
+        "import os,time;from pathlib import Path;"
+        f"Path({str(started)!r}).write_text(str(os.getpid()));time.sleep(30)"
+    )
+    parent_code = (
+        "import subprocess,sys,time;"
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);time.sleep(30)"
+    )
+    job = OwnedJob()
+    process = subprocess.Popen(
+        [sys.executable, "-c", parent_code],
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        job.assign(process)
+        deadline = time.monotonic() + 10
+        while not (started.exists() and started.read_text()):
+            assert time.monotonic() < deadline, "Owned descendant did not start"
+            time.sleep(0.01)
+        descendant = psutil.Process(int(started.read_text()))
+        job.close()
+        process.wait(timeout=10)
+        # Orphaned by the compiler's end, then reaped: gone within the timeout
+        descendant.wait(timeout=10)
+    finally:
+        job.close()
+        process.wait(timeout=10)
+
+
 def test_compiler_owns_real_interpreter_and_preserves_virtual_environment(
     monkeypatch, tmp_path
 ):
@@ -196,11 +240,13 @@ def test_compiler_owns_real_interpreter_and_preserves_virtual_environment(
     monkeypatch.setattr(cache.sys, "_base_executable", str(base))
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    gpu = SimpleNamespace(
-        index=0,
-        get_current_vram_usage=lambda: SimpleNamespace(used=0, total=32_000_000_000),
+    monkeypatch.setattr(
+        cache,
+        "get_vram_usage",
+        lambda index: (
+            SimpleNamespace(used=0, total=32_000_000_000) if index == 0 else None
+        ),
     )
-    monkeypatch.setattr(cache, "nvidia", SimpleNamespace(devices=[gpu]))
 
     class Job:
         def assign(self, process):
@@ -227,7 +273,16 @@ def test_compiler_owns_real_interpreter_and_preserves_virtual_environment(
     )
     context = cast(NodeContext, SimpleNamespace())
     cache.build(context, BundlePaths(tmp_path), tmp_path, torch.device("cpu"))
-    assert Path(launched["command"][0]) == base
-    assert launched["env"]["__PYVENV_LAUNCHER__"] == str(launcher)
-    assert launched["creationflags"] & 0x00000004
-    assert calls == ["assign", "resume", "close", "wait"]
+    if sys.platform == "win32":
+        assert Path(launched["command"][0]) == base
+        assert launched["env"]["__PYVENV_LAUNCHER__"] == str(launcher)
+        assert launched["creationflags"] & 0x00000004
+        assert calls == ["assign", "resume", "close", "wait"]
+    else:
+        # The current interpreter (a venv's own, no redirector) leads a session of
+        # its own, the job's process group, started running
+        assert Path(launched["command"][0]) == launcher
+        assert "__PYVENV_LAUNCHER__" not in launched["env"]
+        assert launched["start_new_session"] is True
+        assert launched["creationflags"] == 0
+        assert calls == ["assign", "close", "wait"]

@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from contextlib import suppress
@@ -16,6 +17,7 @@ from typing import cast
 
 import numpy as np
 import pytest
+from scratch_storage import NO_FFMPEG, STORAGE
 
 # The node's modules load the native backend, which GitHub's checks do not build.
 pytest.importorskip("nodes.impl._chainner_graph")
@@ -43,12 +45,9 @@ from packages.chaiNNer_standard.image.video_frames.save_video import (
     save_video_node,
 )
 
-STORAGE = Path(os.environ.get("APPDATA", "")) / "chaiNNer" / "backend-storage"
 FFMPEG = str(get_executable_path(STORAGE / "ffmpeg")[0])
 
-pytestmark = pytest.mark.skipif(
-    not Path(FFMPEG).exists(), reason="the integrated FFmpeg is not downloaded"
-)
+pytestmark = pytest.mark.skipif(not Path(FFMPEG).exists(), reason=NO_FFMPEG)
 
 OLD = 1_000_000_000  # An mtime (2001) no write of this test can produce.
 # Random muxer IDs and dates differ run to run; bitexact leaves the bytes the options give.
@@ -242,18 +241,25 @@ def test_a_failed_encoder_leaves_the_file_before(tmp_path: Path):
     assert path.stat().st_mtime == OLD
 
 
-KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
-KERNEL32.CreateFileW.restype = ctypes.c_void_p
-KERNEL32.CreateFileW.argtypes = [
-    ctypes.c_wchar_p,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_void_p,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_void_p,
-]
-KERNEL32.CloseHandle.argtypes = [ctypes.c_void_p]
+# Windows file handles, whose sharing modes can keep a rename from a file
+if sys.platform == "win32":
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    KERNEL32.CreateFileW.restype = ctypes.c_void_p
+    KERNEL32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    KERNEL32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+held_files = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="a file another program holds blocks a rename on Windows alone",
+)
 
 
 def hold(path: Path) -> int:
@@ -267,6 +273,7 @@ def hold(path: Path) -> int:
     return handle
 
 
+@held_files
 def test_a_target_the_rename_cannot_replace_fails_before_encoding(tmp_path: Path):
     # The node checks the path before FFmpeg starts, so no encode is lost to a file
     # another program holds: the error open(path, "wb") style names the path.
@@ -286,6 +293,7 @@ def test_a_target_the_rename_cannot_replace_fails_before_encoding(tmp_path: Path
 
 
 @pytest.mark.parametrize("released", [True, False])
+@held_files
 def test_a_rename_failing_at_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, released: bool
 ):

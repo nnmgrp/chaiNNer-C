@@ -124,6 +124,8 @@ NATIVE_TOOLCHAIN = {
     "clang_cl": "23.1.2",
     "msvc_toolset": "14.44.35207",
     "windows_sdk": "10.0.26100.0",
+    "tensorrt_major": "11",
+    "cuda_major": "13",
 }
 PROFILE = {
     "settings.json": b'{"hardwareAcceleration":false}',
@@ -736,6 +738,23 @@ def test_the_tensorrt_runner_ships_when_built_and_is_never_required(package_case
     assert case.run()["result"] == "verified_no_op"
 
 
+def test_the_amd_gpu_binaries_ship_when_built_and_are_never_required(package_case):
+    case = package_case
+    case.run()
+    for name in package_files.AMD_BINARIES:
+        write(case.backend, name, b"AMD GPU binary fixture")
+    result = case.run()
+    assert (result["result"], result["written_files"]) == ("refreshed", 3)
+    backend = package_manifest.load(case.manifest)["backend"]
+    assert all(packaged(name) in backend for name in package_files.AMD_BINARIES)
+    for name in package_files.AMD_BINARIES:
+        (case.backend / name).unlink()
+    assert case.run()["result"] == "refreshed"
+    backend = package_manifest.load(case.manifest)["backend"]
+    assert not any(packaged(name) in backend for name in package_files.AMD_BINARIES)
+    assert case.run()["result"] == "verified_no_op"
+
+
 def test_removed_backend_file_differing_from_its_record_is_kept(package_case):
     case = package_case
     case.run()
@@ -874,6 +893,12 @@ def test_the_hosts_server_dependencies_ship_at_the_locks_pins():
     assert not {canonicalize_name(name) for name in declared} & excluded
 
 
+# The tools build the Windows package, whose markers they evaluate where they run
+WINDOWS_PACKAGE = pytest.mark.skipif(
+    sys.platform != "win32", reason="the package tools build the Windows package"
+)
+
+
 def refused(case, message):
     """The run fails with message in both modes, before anything is written."""
     for mode in (("--validate-only",), ()):
@@ -899,7 +924,11 @@ def test_every_excluded_distribution_must_be_in_the_runtime(package_case, name):
     ("requires", "requiring"),
     [
         (["pytest>=8"], "colorama: pytest>=8"),
-        (["coverage; sys_platform == 'win32'"], "colorama: coverage"),
+        pytest.param(
+            ["coverage; sys_platform == 'win32'"],
+            "colorama: coverage",
+            marks=WINDOWS_PACKAGE,
+        ),
         # The extra typing-extensions declares for tests becomes active once a
         # shipped distribution asks for it.
         (["typing-extensions[test]"], "typing-extensions: pytest; extra == 'test'"),
@@ -1086,9 +1115,8 @@ def test_a_relock_installs_the_locks_url_pins_as_they_are():
     # The forks' wheels (spandrel, onnxruntime-gpu) are direct-URL pins: a -Relock installs them only
     # from its $Packages list, so each must be the lock's line, or a relock quietly swaps the wheel.
     script = REPOSITORY / "native/tools/provision_runtime.ps1"
-    block = re.search(
-        r"\$Packages = @\(\n(.*?)\n\s*\)", script.read_text(encoding="utf-8"), re.S
-    )
+    text = script.read_text(encoding="utf-8")
+    block = re.search(r"\$Packages = @\(\n(.*?)\n\s*\)", text, re.S)
     assert block, "provision_runtime.ps1 has no $Packages block"
     relock = {
         name
@@ -1096,6 +1124,8 @@ def test_a_relock_installs_the_locks_url_pins_as_they_are():
         if not line.lstrip().startswith("#")
         for name in re.findall(r"'([^']+)'", line.split("  #")[0])
     }
+    # ONNX Runtime's pin is the block's $OnnxRuntimePin, set per GPU stack (-Rocm or not).
+    relock.update(re.findall(r"\$OnnxRuntimePin = '([^']+)'", text))
     lock = (REPOSITORY / "native/python-stack.lock.txt").read_text(encoding="utf-8")
     url_pins = [
         line.split("  #")[0]
@@ -1116,6 +1146,7 @@ def test_the_runtime_is_read_as_it_is_now(package_case):
         assert f"late-{index}" in package_files.runtime_distributions(case.python)
 
 
+@WINDOWS_PACKAGE
 def test_the_version_probe_asks_the_interpreter_itself():
     python = Path(sys.executable).parent
     assert package_port.interpreter_version(python) == (

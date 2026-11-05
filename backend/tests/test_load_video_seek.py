@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -21,7 +22,9 @@ from typing import Any, cast
 
 import ffmpeg
 import numpy as np
+import psutil
 import pytest
+from scratch_storage import NO_FFMPEG, STORAGE
 
 # The video module loads the native backend, which GitHub's checks do not build.
 pytest.importorskip("nodes.impl._chainner_graph")
@@ -43,13 +46,10 @@ from packages.chaiNNer_standard.image.video_frames.load_video import (
     load_video_node,
 )
 
-STORAGE = Path(os.environ.get("APPDATA", "")) / "chaiNNer" / "backend-storage"
 FFMPEG, FFPROBE = map(str, get_executable_path(STORAGE / "ffmpeg"))
 ENV = FFMpegEnv(ffmpeg=FFMPEG, ffprobe=FFPROBE)
 
-pytestmark = pytest.mark.skipif(
-    not Path(FFMPEG).exists(), reason="the integrated FFmpeg is not downloaded"
-)
+pytestmark = pytest.mark.skipif(not Path(FFMPEG).exists(), reason=NO_FFMPEG)
 AUTO = (Matrix.AUTO, Transfer.AUTO, Primaries.AUTO, Range.AUTO, ChromaLocation.AUTO)
 SOURCE = ("-f", "lavfi", "-i", "testsrc2=size=192x108:rate=30", "-frames:v", "150")
 H264 = "h264-bframes.mp4"
@@ -273,7 +273,8 @@ def test_the_index_numbers_only_the_frames_it_can_time(
     # one (MPEG-PS times only some), or packets of which none is shown, would give a
     # short or empty index, so such a file is read through the FFmpeg CLI
     # (_UseCliReader, the reason its message). A discarded packet (never shown) needs no
-    # timestamp; the empty packet that ends the demux (it flushes the decoder) is none.
+    # timestamp, and is counted; the empty packet that ends the demux (it flushes the
+    # decoder) is none.
     def packet(
         pts: int | None, keyframe: bool = False, discard: bool = False, size: int = 100
     ):
@@ -299,7 +300,7 @@ def test_the_index_numbers_only_the_frames_it_can_time(
     cases: list[tuple[list[SimpleNamespace], video.FrameIndex | str]] = [
         (
             [packet(None, discard=True), packet(3, True), packet(1), packet(2), flush],
-            video.FrameIndex((1, 2, 3), (2,)),
+            video.FrameIndex((1, 2, 3), (2,), 1),
         ),
         ([flush], video.FrameIndex((), ())),
         (
@@ -327,7 +328,19 @@ def test_the_index_numbers_only_the_frames_it_can_time(
 
 
 def locked(path: Path) -> bool:
-    """Whether a reader holds `path` open: Windows renames no file that is open."""
+    """Whether a reader holds `path` open: Windows renames no file that is open;
+    elsewhere this process (PyAV) or a reader it started (FFmpeg) lists it open."""
+    if sys.platform != "win32":
+        this = psutil.Process()
+        held = set()
+        for process in (this, *this.children(recursive=True)):
+            try:
+                held.update(Path(file.path) for file in process.open_files())
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # A reader that ended meanwhile, or is ending (its memory gone, so
+                # its files are no longer listed), is not the one that holds it
+                continue
+        return path.resolve() in held
     moved = path.with_name(path.name + ".moved")
     try:
         os.replace(path, moved)
@@ -359,7 +372,9 @@ def test_preview_reader_steps(folder: Path, monkeypatch: pytest.MonkeyPatch, cli
     # The steps' frames equal the RGB float full read's, in every Mode. PyAV decodes
     # forward when that passes fewer frames than a seek to the frame's keyframe (the
     # decoder's place is past it: keyframes every 60 frames here) and seeks otherwise:
-    # to an earlier frame, or to a later GOP.
+    # to an earlier frame, or to a later GOP. The node's reader stays open between the
+    # steps: PyAV's container holds the file, the CLI's FFmpeg does until it has sent
+    # the video's last frame (149), after which it may end by itself.
     path = folder / "steps.mp4"
     shutil.copyfile(made(folder, H264), path)
     full = rgb_float_frames(path)
@@ -382,8 +397,10 @@ def test_preview_reader_steps(folder: Path, monkeypatch: pytest.MonkeyPatch, cli
             frame = video.preview_frame(mode, loader, n)
             assert frame.dtype == np.float32
             np.testing.assert_array_equal(frame, full[n])
+            if not cli or n != 149:
+                assert locked(path)
         assert seeks == ([] if cli else [30, 29, 140, 0, 61, 149])
-        assert locked(path)
+        assert mode in vars(video)["_previews"]
     with pytest.raises(ValueError, match=r"^frame 150 is past the end"):
         video.preview_frame("planes", loader, 150)
     with pytest.raises(ValueError, match=r"^frame -1 is before the start"):

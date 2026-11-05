@@ -300,8 +300,8 @@ def _make_executable(ffmpeg_path: Path, ffprobe_path: Path) -> None:
     if is_mac or is_linux:
         # Make the files executable
         try:
-            ffmpeg_path.chmod(0o7777)
-            ffprobe_path.chmod(0o7777)
+            ffmpeg_path.chmod(0o755)
+            ffprobe_path.chmod(0o755)
         except Exception as e:
             logger.warn(f"Failed to set permissions for ffmpeg: {e}")
 
@@ -397,7 +397,8 @@ def setup_integrated_ffmpeg(base_dir: Path):
     folder next to base_dir, which gets the marker and becomes base_dir by a rename
     once both executables are in it. A setup that stops midway or a download whose
     SHA-256 differs installs nothing (the next use starts over) and leaves an FFmpeg in
-    place as it was."""
+    place as it was; the .part and .tmp of a process that a crash ended are removed at
+    the backend's next start (leftovers.py)."""
     platform = get_platform()
     pin = PINS[platform]
     parent = base_dir.parent

@@ -11,6 +11,7 @@
 #include "image_encode.hpp"
 #include "image_preview.hpp"
 #include "numpy_pool.hpp"
+#include "save_path.hpp"
 #include <pybind11/numpy.h>
 #include <pybind11/stl/filesystem.h>
 #include <algorithm>
@@ -51,7 +52,12 @@ template<typename... A> O format(const char* text, A&&... args) { return py::str
 std::filesystem::path file_path(const O& path) {
     const py::str text(path);
     if(PyUnicode_FindChar(text.ptr(),0,0,PyUnicode_GET_LENGTH(text.ptr()),1)>=0)
+#ifdef _WIN32
         raise(PyExc_ValueError,py::str("embedded null character"));
+#else
+        // open() encodes a path to the file system's bytes there
+        raise(PyExc_ValueError,py::str("embedded null byte"));
+#endif
     return text.cast<std::filesystem::path>();
 }
 [[noreturn]] void rethrow_value(const O& error) { PyErr_SetObject(reinterpret_cast<PyObject*>(Py_TYPE(error.ptr())),error.ptr()); throw py::error_already_set(); }
@@ -74,39 +80,6 @@ void with_object(O context, const std::function<void(O)>& body) {
     exit(context,py::none(),py::none(),py::none());
 }
 O get_ext(py::dict g, O path) { return index(name(g,"split_file_path")(path),2).attr("lower")(); }
-
-// The default PNG (cn::image_encode::png) of a uint8 grey (2-D, or one channel), grey + alpha, BGR or BGRA array;
-// None when the encoder declines. All codec dispatch decisions happen before compression; a failure in the selected
-// encoder is reported, never retried through another codec. Other dtypes/channels/options retain OpenCV semantics.
-O encode_png(const O& image) {
-    if (!py::isinstance<py::array>(image)) return py::none();
-    py::array input=py::reinterpret_borrow<py::array>(image);
-    if ((input.ndim()!=2 && input.ndim()!=3) || input.itemsize()!=1 || input.dtype().kind()!='u') return py::none();
-    O encoded;
-    cn::image_encode::Png result;
-    {
-        // Keep input alive and snapshot every Python-owned field before release.
-        const auto* source=static_cast<const uint8_t*>(input.data());
-        const bool grey=input.ndim()==2;
-        const ptrdiff_t height=input.shape(0),width=input.shape(1),channels=grey?1:input.shape(2);
-        const ptrdiff_t row_stride=input.strides(0),pixel_stride=input.strides(1),channel_stride=grey?1:input.strides(2);
-        py::gil_scoped_release release;
-        // The file's bytes go straight into a bytes object, made under the GIL once the size is known; nothing else
-        // sees it before it is returned.
-        result=cn::image_encode::png(source,height,width,channels,row_stride,pixel_stride,channel_stride,
-            [&](size_t size)->uint8_t* {
-                py::gil_scoped_acquire acquire;
-                PyObject* bytes=size<=size_t(PY_SSIZE_T_MAX)?PyBytes_FromStringAndSize(nullptr,Py_ssize_t(size)):nullptr;
-                if(!bytes){PyErr_Clear();return nullptr;} // raised below as the MemoryError it is
-                encoded=py::reinterpret_steal<O>(bytes);
-                return reinterpret_cast<uint8_t*>(PyBytes_AS_STRING(bytes));
-            });
-    }
-    if(result==cn::image_encode::Png::declined)return py::none();
-    if(result==cn::image_encode::Png::out_of_memory)throw std::bad_alloc();
-    if(result==cn::image_encode::Png::failed)throw std::runtime_error("the PNG encoder failed to encode the image");
-    return encoded;
-}
 
 // Copy a channel permutation with the codec's native-endian dtype. Reading
 // through byte pointers also supports unaligned, negative and readonly strides.
@@ -357,7 +330,9 @@ O read_tiff_alpha(py::dict g,O path) {
 }
 O read_dds(py::dict g,O path) {
     if(!equal(name(g,"get_ext")(path),py::str(".dds")))return py::none();
+#ifdef _WIN32
     if(!equal(name(g,"platform").attr("system")(),py::str("Windows")))return py::none();
+#endif // Linux runs native/texconv
     return name(g,"remove_unnecessary_alpha")(name(g,"read_dds_texconv")(path));
 }
 O decode_ext(O extensions,O decoder,O extension_fn,O path) {
@@ -391,7 +366,26 @@ O load_image(py::dict g,O path) {
     }
     return py::make_tuple(image,index(parts,0),index(parts,1));
 }
-O full_path(O base,O relative,O filename,O format_type) {
+// A writer's Subdirectory Path or file name (its input `label`) that leaves the output directory or names a Windows
+// device: the node's error (save_path.hpp). Encoded with surrogatepass, so any str is checked.
+void refuse(const O& value,const O& node,const O& label) {
+    if(!py::isinstance<py::str>(value))return;
+    const std::string text=value.attr("encode")("utf-8","surrogatepass").cast<std::string>();
+    const cn::save_path::Refusal refusal=cn::save_path::check(text);
+    if(refusal.kind==cn::save_path::Refusal::leaves)
+        raise(PyExc_ValueError,format("{}: the {} \"{}\" leaves the output directory: \"..\" and absolute paths are not"
+            " allowed; give a path inside it.",node,label,value));
+    if(refusal.kind!=cn::save_path::Refusal::reserved)return;
+    if(refusal.part.size()==text.size())
+        raise(PyExc_ValueError,format("{}: the {} \"{}\" is a reserved Windows device name; choose another name.",node,
+            label,value));
+    const O part=py::bytes(refusal.part.data(),refusal.part.size()).attr("decode")("utf-8","surrogatepass");
+    raise(PyExc_ValueError,format("{}: the {} \"{}\" contains the reserved Windows device name \"{}\"; choose another"
+        " name.",node,label,value,part));
+}
+O full_path(O base,O relative,O filename,O format_type,O node,O name_label) {
+    refuse(relative,node,py::str("Subdirectory Path"));
+    refuse(filename,node,name_label);
     O file=format("{}.{}",filename,format_type.attr("extension"));
     if(truth(relative)&&!equal(relative,py::str(".")))base=path_join(base,relative);
     return path_join(base,file).attr("resolve")();
@@ -407,8 +401,17 @@ constexpr size_t save_inputs=25,avif_subsampling=23,skip_existing=24;
 bool pillow_format(const py::dict& g,const O& format_type) {
     return option(g,format_type,"ImageFormat","GIF")||option(g,format_type,"ImageFormat","TGA")||option(g,format_type,"ImageFormat","AVIF");
 }
+// Refuses an image of any but 1, 3 or 4 channels: no encoder holds other counts as an image (PNG's grey + alpha would
+// pass two planes off as one).
+void check_channels(const O& image,const O& action) {
+    py::tuple shape=image.attr("shape");
+    const long channels=shape.size()<3?1:shape[2].cast<long>();
+    if(channels!=1&&channels!=3&&channels!=4)
+        raise(PyExc_RuntimeError,format("Unsupported number of channels. {} is only supported for grayscale, RGB, and RGBA images.",action));
+}
 Encoding encoding(py::dict g,O image,py::tuple args) {
     O format_type=args[4];
+    check_channels(image,format("Saving .{} images",format_type.attr("extension")));
     Encoding result;
     // OpenCV's lossless WebP lets libwebp change the colour under alpha 0; Pillow's
     // exact=True keeps every sample (an RGB image has no such pixels).
@@ -421,7 +424,6 @@ Encoding encoding(py::dict g,O image,py::tuple args) {
         O channels=index(name(g,"get_h_w_c")(image),2);
         if(equal(channels,py::int_(3)))image=swap_channels(g,image,"COLOR_BGR2RGB");
         else if(equal(channels,py::int_(4)))image=swap_channels(g,image,"COLOR_BGRA2RGBA");
-        else if(!equal(channels,py::int_(1)))raise(PyExc_RuntimeError,format("Unsupported number of channels. Saving .{} images is only supported for grayscale, RGB, and RGBA images.",format_type.attr("extension")));
         result.image=image;result.pillow=true;result.exact_webp=exact_webp;
         return result;
     }
@@ -471,10 +473,8 @@ bool codec_image(const O& value,cn_codec_image& image) {
 // Runs an encoder without the GIL into a NumPy-pool block; the encoded bytes as a uint8 array that owns the block
 // (as cv2.imencode returns its buffer), or None when it declines.
 O run_encoder(const std::function<cn_codec_status(cn_codec_output&)>& encoder) {
-    cn::codecs::Output output;
+    cn::codecs::PoolOutput output;
     auto& out=output.value;
-    out.allocate=cn_numpy_pool_allocate;
-    out.release=cn_numpy_pool_free;
     cn_codec_status status;
     {
         py::gil_scoped_release release;
@@ -484,6 +484,28 @@ O run_encoder(const std::function<cn_codec_status(cn_codec_output&)>& encoder) {
     py::capsule owner(out.data,[](void* data){cn_numpy_pool_free(data);});
     out.data=nullptr; // The capsule owns the buffer only after its construction succeeds.
     return py::array_t<uint8_t>({py::ssize_t(out.size)},{py::ssize_t(1)},owner.get_pointer<uint8_t>(),owner);
+}
+// The default PNG (cn::image_encode::png) of a uint8 grey (2-D, or one channel), grey + alpha, BGR or BGRA array, as
+// run_encoder's array, so a batch's files reuse one warm block; None when the encoder declines. All codec dispatch
+// decisions happen before compression; a failure in the selected encoder is reported, never retried through another
+// codec. Other dtypes/channels/options retain OpenCV semantics.
+O encode_png(const O& image) {
+    if (!py::isinstance<py::array>(image)) return py::none();
+    py::array input=py::reinterpret_borrow<py::array>(image);
+    if ((input.ndim()!=2 && input.ndim()!=3) || input.itemsize()!=1 || input.dtype().kind()!='u') return py::none();
+    // Keep input alive and snapshot every Python-owned field before run_encoder releases the GIL.
+    const auto* source=static_cast<const uint8_t*>(input.data());
+    const bool grey=input.ndim()==2;
+    const ptrdiff_t height=input.shape(0),width=input.shape(1),channels=grey?1:input.shape(2);
+    const ptrdiff_t row_stride=input.strides(0),pixel_stride=input.strides(1),channel_stride=grey?1:input.strides(2);
+    cn::image_encode::Png result;
+    O encoded=run_encoder([&](cn_codec_output& out){
+        result=cn::image_encode::png(source,height,width,channels,row_stride,pixel_stride,channel_stride,out);
+        return result==cn::image_encode::Png::encoded?CN_CODEC_OK:CN_CODEC_FALLBACK;
+    });
+    if(result==cn::image_encode::Png::out_of_memory)throw std::bad_alloc();
+    if(result==cn::image_encode::Png::failed)throw std::runtime_error("the PNG encoder failed to encode the image");
+    return encoded;
 }
 bool extension_is(const O& extension,std::initializer_list<const char*> names) {
     if(!PyUnicode_Check(extension.ptr()))return false;
@@ -648,8 +670,9 @@ void save_image(py::dict g,py::tuple args,O prepared) {
 }
 // Save Image's prepare phase (SP3-P9): the bytes save_image writes for these
 // inputs (input 0 the image itself) to a path with the format's own extension,
-// encoded in memory; None for DDS, which texconv writes itself, and for a file
-// the commit skips as existing, which it never encodes.
+// encoded in memory, as bytes or the encoder's buffer array; None for DDS, which
+// texconv writes itself, and for a file the commit skips as existing, which it
+// never encodes.
 O save_prepare(py::dict g,py::tuple args) {
     if(args.size()!=save_inputs)raise(PyExc_TypeError,format("Image save expects {} input values",save_inputs));
     O format_type=args[4];
@@ -658,8 +681,7 @@ O save_prepare(py::dict g,py::tuple args) {
     O extension=add(py::str("."),format_type.attr("extension"));
     Encoding encoded=encoding(g,args[0],args);
     if(encoded.pillow)return pillow_bytes(g,encoded,extension);
-    O buffer=encode(g,extension,encoded.image,encoded.params);
-    return PyBytes_CheckExact(buffer.ptr())?buffer:O(buffer.attr("tobytes")());
+    return encode(g,extension,encoded.image,encoded.params);
 }
 // LargeImageOutput.get_broadcast_data's previews of an enforced image (cn::image_preview, without the GIL): a list
 // of {"width", "height", "url"}, or None when the native path declines and today's Python loop runs.
@@ -686,6 +708,7 @@ O previews(O value) {
     return list;
 }
 void view_image(py::dict g,O image) {
+    check_channels(image,py::str("Viewing images"));
     O temporary=name(g,"mkdtemp")(py::arg("prefix")="chaiNNer-");
     name(g,"logger").attr("debug")(format("Writing image to temp path: {}",temporary));
     O filename=format("{}.png",name(g,"time").attr("time")());
@@ -720,10 +743,32 @@ O decode_bytes(O bytes) {
         catch(py::error_already_set& second){if(!second.matches(PyExc_Exception))throw;GraphHandledException second_context(second);return py::str(bytes);}
     }
 }
+#ifndef _WIN32
+// Linux's texconv (native/texconv), run as Windows runs texconv.exe. An archive tool that drops file modes leaves it
+// without its execute bit, which comes back here; one that still cannot run (a file system mounted noexec) is named.
+O run_linux_texconv(py::dict g,const py::list& command) {
+    O os=name(g,"os"),texconv=command[0];
+    try {
+        if(truth(os.attr("access")(texconv,os.attr("F_OK")))&&!truth(os.attr("access")(texconv,os.attr("X_OK"))))
+            os.attr("chmod")(texconv,O(os.attr("stat")(texconv).attr("st_mode"))|py::int_(0111));
+        return name(g,"subprocess").attr("run")(command,py::arg("check")=false,py::arg("capture_output")=true);
+    } catch(py::error_already_set& error) {
+        if(!error.matches(PyExc_OSError))throw;
+        GraphHandledException context(error);
+        raise(PyExc_ValueError,format("texconv cannot run: {} must be an executable file on a file system that runs programs (not mounted noexec)",texconv));
+    }
+}
+#endif
 void run_texconv(py::dict g,O args,O error_message) {
+#ifdef _WIN32
     if(!equal(name(g,"platform").attr("system")(),py::str("Windows")))raise(PyExc_ValueError,py::str("Texconv is only supported on Windows. Reading and writing DDS files is only partially supported on other systems."));
+#endif // Linux runs native/texconv
     py::list command;command.append(name(g,"__TEXCONV_EXE"));command.append("-nologo");command.attr("extend")(args);
+#ifdef _WIN32
     O result=name(g,"subprocess").attr("run")(command,py::arg("check")=false,py::arg("capture_output")=true);
+#else
+    O result=run_linux_texconv(g,command);
+#endif
     if(!equal(result.attr("returncode"),py::int_(0))) {
         O output=add(name(g,"__decode")(result.attr("stdout")),name(g,"__decode")(result.attr("stderr"))).attr("replace")("\r","");
         py::list lines;lines.append("Failed to run texconv.");lines.append(format("texconv: {}",name(g,"__TEXCONV_EXE")));lines.append(format("args: {}",args));lines.append(format("exit code: {}",result.attr("returncode")));lines.append(format("output: {}",output));

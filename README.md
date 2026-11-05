@@ -29,22 +29,52 @@ chaiNNer-org. For chaiNNer itself, its documentation and its community, see the
 
 ## Download and run
 
-1. Download the latest `chaiNNer-C-…-win-x64.zip` from the [Releases page](https://github.com/Rift73/chaiNNer-C/releases).
+1. Download the latest `chaiNNer-C-…-win-x64.zip` from the [Releases page](https://github.com/nnmgrp/chaiNNer-C/releases).
 2. Unzip it anywhere and run **`chaiNNer.exe`**.
 3. On first start, chaiNNer-C downloads its own Python. Then open the **dependency manager** (as in chaiNNer) to
    install the packages for the nodes you want, for example PyTorch, ONNX Runtime, NCNN or TensorRT.
 
 chaiNNer-C doesn't update itself; check the Releases page for new versions.
 
+On Linux, download `chaiNNer-C-…-linux-x64.zip` from the same page; it unzips to `chaiNNer-linux-x64/`, where you run
+`./chaiNNer.sh` ([On Linux](#on-linux)).
+
 ## System requirements
 
-- **Windows 10 or 11, 64-bit.**
+- **Windows 10 or 11, 64-bit, or Linux x86-64 with glibc 2.28 or newer:** Ubuntu 20.04, Debian 10, RHEL, Rocky and
+  AlmaLinux 8 and every later release of them, and current Fedora, Arch and openSUSE.
 - **Any reasonably modern 64-bit Intel or AMD CPU:** Intel from about 2009 on, AMD from about 2011 on. Every PC that
   runs Windows 11 qualifies. (Technically: x86-64-v2, the baseline NumPy 2 requires.) Newer CPUs with AVX2 or AVX-512
   are used automatically for extra speed.
-- **A GPU is optional.** PyTorch, ONNX Runtime and TensorRT use NVIDIA GPUs; NCNN runs on any Vulkan GPU.
+- **A GPU is optional.** PyTorch, ONNX Runtime (also through TensorRT) and TensorRT use NVIDIA GPUs, on Linux as on
+  Windows; NCNN runs on any Vulkan GPU. Without a supported GPU the CPU does the work.
 
-Not supported: 32-bit Windows, ARM PCs (such as Snapdragon laptops), macOS and Linux.
+Not supported: 32-bit systems, ARM PCs (such as Snapdragon laptops) and ARM Linux, Linux without glibc (such as
+Alpine), and macOS.
+
+### On Linux
+
+- Unzip to a folder you can write to: like the Windows zip, chaiNNer-C keeps its settings, logs and Python in the folder
+  it runs from. Start `./chaiNNer.sh` from the unzipped `chaiNNer-linux-x64/`. An archive tool that drops file modes
+  (such as Python's `zipfile`) leaves `chaiNNer.sh` and `chainner` not executable: `chmod +x chaiNNer.sh chainner
+  resources/src/texconv/texconv` (chaiNNer-C also restores the last, its DDS converter, itself).
+- A minimal install can lack system libraries that Electron, OpenCV or VapourSynth link against. At every start,
+  `chaiNNer.sh` checks for them and, if some are missing, lists them and prints the command that installs them for your
+  distribution (`apt-get`, `dnf`, `pacman` or `zypper`). `CHAINNER_SKIP_LIBRARY_CHECK=1` skips the check.
+- Chromium's sandbox needs user namespaces, which some systems do not allow (Docker, Ubuntu 23.10 and later, hardened
+  kernels). There `chaiNNer.sh` starts without the sandbox and says so. `CHAINNER_SANDBOX=0` always starts without it
+  and `CHAINNER_SANDBOX=1` always with it.
+- `./chaiNNer.sh run chain.chn` (the command line) also needs a display, because Electron cannot start without one. On a
+  server, install `xvfb` and `xauth`; the script then runs the chain on a virtual display.
+- Copy To Clipboard needs `wl-clipboard` (Wayland) or `xclip` (X11).
+- DDS files are read and written by chaiNNer-C's own texconv, built on the DirectXTex release Windows' texconv.exe
+  comes from, with the same results except some steps Windows runs through its imaging component (WIC): the Cubic
+  mip filter on 8-bit formats, a colour image saved to a one-channel 8- or 16-bit format, and the
+  mip levels of a few formats (SNORM, 4-bit), which can differ by a step. BC6H and BC7 compress on the CPU.
+- Limits: every package works from glibc 2.28; below glibc 2.34 (RHEL 8, Ubuntu 20.04, Debian 10 and 11) VapourSynth's
+  Preview Clips cannot open vsview, whose Qt needs a newer one. A result that goes through the C math library (for
+  example the exponentials and trigonometry of Resize's filters) follows the system's library on Linux, as NumPy does,
+  so it can differ from Windows in the last bit, and between glibc versions.
 
 ## FAQ
 
@@ -71,7 +101,12 @@ npm ci                                                                      # in
 npm start                                                                   # run chaiNNer-C
 ```
 
-Details (development setup, tests, packaging, toolchain options) are in [`native/BUILDING.md`](native/BUILDING.md).
+On Linux (x86-64) you need LLVM 23.1.2, NASM 3.01, CMake, Ninja and Node.js, and run
+`native/tools/provision_runtime.sh --build-only` and `native/build_linux.sh` in place of the two PowerShell scripts;
+`native/tools/build_linux_release.sh` builds the zip in Docker.
+
+Details (development setup, tests, packaging, toolchain options, Linux) are in
+[`native/BUILDING.md`](native/BUILDING.md).
 
 ## Documentation
 

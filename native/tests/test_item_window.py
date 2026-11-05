@@ -202,6 +202,17 @@ def test_read_ahead_blocker_reports_a_path_it_cannot_resolve(
         # folder: outside the output directory it allows read-ahead, under it it
         # blocks.
         outside = Path("in\0valid") / "a.png"
+        if os.name != "nt":
+            # POSIX resolve() stats each component, which a NUL fails: reported,
+            # and read-ahead blocked, wherever the folder is
+            for source in (outside, tmp_path / "in\0valid" / "a.png"):
+                assert (
+                    read_ahead_blocker(
+                        [(NodeId("g0"), (source,))], [(NodeId("save"), tmp_path)]
+                    )
+                    == "path check failed: lstat: embedded null character in path"
+                )
+            return
         assert (
             read_ahead_blocker(
                 [(NodeId("g0"), (outside,))], [(NodeId("save"), tmp_path)]
@@ -1622,9 +1633,10 @@ def test_dependents_of_a_stored_error_meet_it_at_the_nesting_point(
     assert stripped(runs["3"].events) == stripped(runs["1"].events)
 
 
-# The 117 schema ids admitted by pure_cpu_dependency's per-node conditions, each
+# The 118 schema ids admitted by pure_cpu_dependency's per-node conditions, each
 # audited in native/reports/sp3/thread-safety-audit.md (SP3 Task 4; the locked device
-# node, 2026-10-08; Descale, 2026-10-16; Planes to RGB and RGB to Planes, 2026-10-18).
+# node, 2026-10-08; Descale, 2026-10-16; Planes to RGB and RGB to Planes, 2026-10-18;
+# MIGraphX's Upscale Image, the TensorRT runner's counterpart, 2026-10-29).
 AUDITED_SPECULATION_IDS: frozenset[str] = frozenset(
     [
         f"chainner:image:{name}"
@@ -1657,7 +1669,7 @@ AUDITED_SPECULATION_IDS: frozenset[str] = frozenset(
         text_pattern text_replace text_slice
         """.split()
     ]
-    + ["chainner:tensorrt:upscale_image"]
+    + ["chainner:tensorrt:upscale_image", "chainner:migraphx:upscale_image"]
 )
 
 
@@ -2944,8 +2956,11 @@ def test_prepared_save_replays_its_upstream_before_writing(monkeypatch, tmp_path
     )
     assert list(files_one) == [f"item-{i}.png" for i in range(5)]
     assert files_three == files_one
-    # prepared bytes count toward the window's in-flight bytes
-    assert any(type(value) is bytes and value for value in counted)
+    # prepared bytes (the encoder's array) count toward the window's in-flight bytes
+    assert any(
+        isinstance(value, np.ndarray) and value.ndim == 1 and value.dtype == np.uint8
+        for value in counted
+    )
 
 
 @pytest.mark.usefixtures("phases_registry")
@@ -3326,7 +3341,7 @@ else:
     NEW.save.save_image_node(**save_arguments(NEW.save, LazyImage(value), out, fmt=case))
     today = (out / f"image.{case.lower()}").read_bytes()
     result["prepared"] = prepared if isinstance(prepared, str) else len(prepared)
-    result["equal"] = prepared == today
+    result["equal"] = not isinstance(prepared, str) and bytes(prepared) == today
 result["torch"] = "torch" in sys.modules
 result["onnxruntime"] = "onnxruntime" in sys.modules
 print(json.dumps(result))

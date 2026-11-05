@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import sys
 import warnings
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -145,7 +146,8 @@ def test_an_engines_alignment_sets_the_padding_and_tile_size():
 
 
 def test_an_engine_too_small_to_tile_still_serves_images_up_to_its_size():
-    # Build Engine allows a 32 px fixed engine; tiles need over 3 * 16 px.
+    # A 32 px fixed engine (from before Build Engine's minimum, or another program);
+    # tiles need over 3 * 16 px.
     bounds = ShapeBounds(32, 32, 32, 32)
     engine = FakeEngine(bounds)
 
@@ -159,6 +161,42 @@ def test_an_engine_too_small_to_tile_still_serves_images_up_to_its_size():
         " tiling it needs an engine input over 48 px. The engine still upscales"
         " images up to 32 px; for larger ones, build it with a size over 48 px."
     )
+
+
+def test_build_engine_sizes_start_where_an_engine_tiles_larger_images():
+    build_engine = pytest.importorskip(
+        "packages.chaiNNer_tensorrt.tensorrt.utility.build_engine"
+    )
+    group = build_engine.utility_group
+    if group is None:
+        pytest.skip("the TensorRT package is not enabled on this machine")
+    (node,) = (
+        n for n in group.nodes if n.schema_id == "chainner:tensorrt:build_engine"
+    )
+    minimum = {i.label: getattr(i, "min", None) for i in node.inputs}
+    sizes = ("Height", "Width", "Max Height", "Max Width")
+    assert {minimum[label] for label in sizes} == {build_engine.MIN_TILE_SIZE}
+    size = build_engine.MIN_TILE_SIZE
+    image = _image()[:100, :100]
+    bounds = ShapeBounds(size, size, size, size)
+    out = tiled_upscale(image, SCALE, bounds, FakeEngine(bounds))
+    assert out.shape == (400, 400, 3)
+    smaller = ShapeBounds(size - 1, size - 1, size - 1, size - 1)
+    with pytest.raises(ValueError, match="needs an engine input over 48 px"):
+        tiled_upscale(image, SCALE, smaller, FakeEngine(smaller))
+
+
+@pytest.mark.parametrize(
+    "size", [(40, 50), (300, 420)], ids=["padded single tile", "several tiles"]
+)
+def test_a_grey_image_stays_as_chainner_holds_it(size: tuple[int, int]):
+    # A grey image is HxW everywhere in chaiNNer; the engine still takes one plane.
+    grey = np.random.default_rng(5).random(size, np.float32)
+    bounds = ShapeBounds(64, 64, 256, 256)
+    out = tiled_upscale(grey, SCALE, bounds, FakeEngine(bounds))
+    assert out.shape == (size[0] * SCALE, size[1] * SCALE)
+    planes = tiled_upscale(grey[:, :, np.newaxis], SCALE, bounds, FakeEngine(bounds))
+    np.testing.assert_array_equal(out, planes[:, :, 0])
 
 
 def test_axis_weights_partition_of_unity():
@@ -236,8 +274,19 @@ def test_native_blend_is_numpys_bit_for_bit(
 
 @contextlib.contextmanager
 def flushed(flush: bool) -> Iterator[None]:
-    """DAZ and FTZ on the calling thread (the CRT's _DN_FLUSH) when flush, which the
-    native pool's helpers take; the default afterwards."""
+    """DAZ and FTZ on the calling thread (the CRT's _DN_FLUSH; on Linux, which has no
+    such call, torch.set_flush_denormal) when flush, which the native pool's helpers
+    take; the default afterwards."""
+    if sys.platform != "win32":
+        import torch
+
+        if flush:
+            assert torch.set_flush_denormal(True)
+        try:
+            yield
+        finally:
+            assert torch.set_flush_denormal(False)
+        return
     control = ctypes.CDLL("ucrtbase.dll")["_controlfp_s"]
     control.argtypes = [ctypes.POINTER(ctypes.c_uint), ctypes.c_uint, ctypes.c_uint]
     word = ctypes.c_uint()

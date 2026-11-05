@@ -433,7 +433,7 @@ export const setMainMenu = ({ mainWindow, menuData, enabled = false }: MainMenuA
                 {
                     label: 'Release Notes',
                     click: async () => {
-                        await shell.openExternal('https://github.com/Rift73/chaiNNer-C/releases');
+                        await shell.openExternal('https://github.com/nnmgrp/chaiNNer-C/releases');
                     },
                 },
                 {

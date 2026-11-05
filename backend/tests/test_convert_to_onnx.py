@@ -19,20 +19,24 @@ from spandrel import ImageModelDescriptor, ModelDescriptor, ModelLoader
 from spandrel.architectures.Compact import Compact
 from spandrel.architectures.DAT import DAT
 from spandrel.architectures.DAT.__arch.DAT import Adaptive_Spatial_Attention
+from spandrel.architectures.DRFT.__arch import drft_arch
 from spandrel.architectures.DRFT.__arch import legacy_drft_arch as legacy
 from spandrel.architectures.DUAL.__arch.dual_arch import dual_xs
 from spandrel.architectures.ESRGAN import ESRGAN
 from spandrel.architectures.HAT import HAT
 from spandrel.architectures.HAT.__arch.HAT import OCAB, WindowAttention
 from spandrel.architectures.MixDehazeNet import MixDehazeNet
+from spandrel.architectures.NAFNet import NAFNet
 
-from api import NodeContext, SettingsParser
+from api import NodeContext, NodeId, SettingsParser
 from nodes.impl.ncnn.model import NcnnModelWrapper
-from nodes.impl.onnx.model import OnnxGeneric
+from nodes.impl.onnx.load import load_onnx_model
+from nodes.impl.onnx.model import ARCH_METADATA_KEY, OnnxGeneric
 from nodes.impl.onnx.onnx_to_ncnn import Onnx2NcnnConverter
 from nodes.impl.onnx.utils import safely_optimize_onnx_model
 from nodes.impl.pytorch import attention_export
 from nodes.impl.pytorch.convert_to_onnx_impl import convert_to_onnx_impl
+from nodes.properties.outputs import OnnxModelOutput
 from packages.chaiNNer_pytorch.pytorch.io import load_model as load_model_module
 from packages.chaiNNer_pytorch.pytorch.io.load_model import load_model
 from packages.chaiNNer_pytorch.pytorch.utility import convert_to_onnx
@@ -132,6 +136,15 @@ def test_the_attention_rewrite_works_on_a_copy(arch: str):
     image = torch.rand(1, 3, 32, 32)
     with torch.no_grad():
         torch.testing.assert_close(export(image), model(image), rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("channels", [1, 2, 3, 4, 5, 15])
+def test_calibration_noise_has_the_models_planes(channels: int):
+    torch.manual_seed(0)
+    net = ESRGAN(in_nc=channels, out_nc=channels, num_filters=8, num_blocks=1, scale=4)
+    model = ModelLoader().load_from_state_dict(net.state_dict())
+    assert isinstance(model, ImageModelDescriptor)
+    assert convert_to_onnx.calibration_input(model, None).shape == (1, channels, 64, 64)
 
 
 def test_hat_heads_are_padded_to_a_multiple_of_8():
@@ -257,14 +270,12 @@ def test_converting_leaves_trainable_weights_trainable():
 class Context:
     """The NodeContext members Convert To ONNX uses: PyTorch on the CPU."""
 
-    def __init__(self, settings: dict[str, object]) -> None:
+    def __init__(self, settings: dict[str, object], node_id: str = "node") -> None:
         self.settings = SettingsParser(settings)
+        self.node_id = NodeId(node_id)
 
 
 CPU_CONTEXT: dict[str, object] = {"use_cpu": True}
-# Off the CPU override, PyTorch runs on the CPU here (CUDA is hidden), where FP16
-# stays on.
-FP16_CONTEXT: dict[str, object] = {"use_cpu": False, "use_fp16": True}
 
 
 def convert(
@@ -275,9 +286,10 @@ def convert(
     calibration: np.ndarray | None = None,
     dual_shape: DualShape = DualShape.DYNAMIC,
     settings: dict[str, object] = CPU_CONTEXT,
+    node_id: str = "node",
 ) -> tuple[OnnxGeneric, str, str]:
     return convert_to_onnx_node(
-        cast(NodeContext, Context(settings)),
+        cast(NodeContext, Context(settings, node_id)),
         model,
         data_type,
         opset,
@@ -360,8 +372,34 @@ def test_a_changed_export_input_drops_the_superseded_export(
     assert second() is None
 
 
+def test_two_nodes_converting_one_model_keep_their_exports(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    exports = count_exports(monkeypatch)
+    model = tiny_model("Compact")
+    first = convert(model, node_id="first")
+    second = convert(model, opset=Opset.OPSET_17, node_id="second")
+    for _ in range(2):
+        assert convert(model, node_id="first")[0] is first[0]
+        assert convert(model, opset=Opset.OPSET_17, node_id="second")[0] is second[0]
+    assert exports == [20, 17]
+
+
+def test_two_nodes_with_the_same_options_share_one_export(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # One ONNX model, so one session (and one TensorRT engine) downstream; a node added
+    # in place of a deleted one reuses its export.
+    exports = count_exports(monkeypatch)
+    model = tiny_model("Compact")
+    first = convert(model, node_id="first")
+    assert convert(model, node_id="second")[0] is first[0]
+    assert convert(model, node_id="third")[0] is first[0]
+    assert exports == [20]
+
+
 def test_a_model_changed_in_place_is_exported_again(monkeypatch: pytest.MonkeyPatch):
-    # Upscale Image converts the shared model to its precision in place.
+    # A model's precision can change in place (half()), which its export depends on.
     exports = count_exports(monkeypatch)
     model = tiny_model("Compact")
     first = convert(model)[0]
@@ -423,9 +461,16 @@ def test_a_dual_rerun_returns_the_kept_export(monkeypatch: pytest.MonkeyPatch):
     assert exports == [None, (512, 512)]
 
 
-# Load Model's settings with PyTorch's FP16 on and off. Off the CPU override, PyTorch
-# runs on the CPU here (CUDA is hidden), where FP16 stays on.
-FP16 = PyTorchSettings(use_cpu=False, use_fp16=True, gpu_index=0, budget_limit=0)
+class GpuSettings(PyTorchSettings):
+    """PyTorch's settings as a GPU has them. The CPU stands in for the GPU here (CUDA
+    is hidden), so FP16 skips the CPU's fallback to FP32."""
+
+    def __post_init__(self) -> None:
+        pass
+
+
+# Load Model's settings with PyTorch's FP16 on and off.
+FP16 = GpuSettings(use_cpu=False, use_fp16=True, gpu_index=0, budget_limit=0)
 FP32 = PyTorchSettings(use_cpu=False, use_fp16=False, gpu_index=0, budget_limit=0)
 
 
@@ -487,13 +532,14 @@ def test_an_fp16_export_does_not_read_the_file_again(
 ):
     reread: list[object] = []
     monkeypatch.setattr(load_model_module, "full_precision", reread.append)
+    monkeypatch.setattr(convert_to_onnx, "get_settings", lambda _: FP16)
     path = model_file(tmp_path, ARCHS["Compact"])
     model = load_model(path, FP16)
     assert isinstance(model, ImageModelDescriptor)
     expected = convert_to_onnx_impl(
         model, torch.device("cpu"), use_half=True, opset_version=20
     )
-    exported = convert(model, OnnxDataType.FP16, settings=FP16_CONTEXT)[0]
+    exported = convert(model, OnnxDataType.FP16)[0]
     assert exported.bytes == expected
     assert reread == []
 
@@ -639,7 +685,7 @@ def to_ncnn(
 ) -> tuple[str, bytes]:
     """PyTorch's Convert To NCNN of `model`: its param and bin."""
     converted, _ = convert_to_ncnn_node(
-        cast(NodeContext, Context(FP16_CONTEXT)), model, is_fp16
+        cast(NodeContext, Context(CPU_CONTEXT)), model, is_fp16
     )
     path = directory / "model.bin"
     converted.model.write_bin(path)
@@ -668,3 +714,143 @@ def test_an_ncnn_conversion_of_a_model_loaded_in_fp16_uses_its_fp32_weights(
     assert rounded != converted
     assert len(logged) == 1 and logged[0].startswith("Convert To NCNN: ")
     assert "does not come from Load Model" in logged[0]
+
+
+# NCNN's layers have fixed shapes; these models take shapes from the image's size as they
+# run (DRFT's windows, NAFNet's padding to a multiple). Each failed with the
+# converter's bare IndexError or KeyError, or an export error.
+NCNN_REFUSED: dict[str, Callable[[], torch.nn.Module]] = {
+    "NAFNet": lambda: NAFNet(
+        width=8, middle_blk_num=1, enc_blk_nums=[1], dec_blk_nums=[1]
+    ),
+    "DRFT": lambda: drft_arch.DRFT(
+        embed_dim=48,
+        depths=(2,),
+        num_heads=(6,),
+        window_size=8,
+        upscale=2,
+        num_feat=16,
+        rank=8,
+        drop_path_rate=0.0,
+    ),
+    "legacy DRFT": tiny_legacy_drft,
+    "legacy DRFT with i-LN": lambda: legacy.DRFT(
+        embed_dim=48,
+        depths=(2,),
+        num_heads=(6,),
+        window_size=8,
+        upscale=2,
+        num_feat=16,
+        rank=8,
+        drop_path_rate=0.0,
+        use_iln=True,
+    ),
+}
+
+
+@pytest.mark.parametrize("arch", NCNN_REFUSED)
+def test_ncnn_refuses_models_that_take_shapes_from_the_image(arch: str, tmp_path: Path):
+    torch.manual_seed(0)
+    model = ModelLoader().load_from_state_dict(NCNN_REFUSED[arch]().state_dict())
+    assert isinstance(model, ImageModelDescriptor)
+    name = model.architecture.name
+    with pytest.raises(AssertionError, match=f"^{name} is not supported for NCNN"):
+        to_ncnn(model, 0, tmp_path)
+
+
+FP16_ARCHS = ["ESRGAN", "HAT", "DAT"]
+
+
+@pytest.mark.parametrize("arch", FP16_ARCHS)
+@pytest.mark.parametrize(
+    "hidden", [OnnxDataType.FP32, OnnxDataType.FP16, OnnxDataType.MIXED_BF16]
+)
+def test_an_fp16_architecture_ignores_a_hidden_data_type(
+    arch: str, hidden: OnnxDataType, monkeypatch: pytest.MonkeyPatch
+):
+    # On the CPU PyTorch's FP16 setting is off, which does not refuse these.
+    exports = count_exports(monkeypatch)
+    onnx_model, fp_mode, opset = convert(tiny_model(arch), hidden)
+    assert (fp_mode, opset) == ("fp16", "opset20")
+    assert onnx_model.info.dtype == "fp16"
+    assert onnx_model.info.arch == arch
+    assert exports == [20]
+
+
+def test_an_fp16_architecture_shares_one_export_across_hidden_data_types(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    exports = count_exports(monkeypatch)
+    model = tiny_model("ESRGAN")
+    first = convert(model, OnnxDataType.FP32)
+    assert convert(model, OnnxDataType.MIXED_FP16)[0] is first[0]
+    assert exports == [20]
+
+
+def test_an_fp16_architecture_refuses_nothing_with_the_fp16_setting_off():
+    settings: dict[str, object] = {"use_cpu": True, "use_fp16": False}
+    onnx_model = convert(tiny_model("ESRGAN"), settings=settings)[0]
+    assert onnx_model.info.dtype == "fp16"
+
+
+def test_an_fp16_architecture_verifies_on_the_cpu():
+    assert convert(tiny_model("ESRGAN"), verify=True)[1] == "fp16"
+
+
+def test_an_fp16_architecture_runs_in_fp16_on_the_cpu():
+    onnx_model = convert(tiny_model("ESRGAN"))[0]
+    session = ort.InferenceSession(onnx_model.bytes, providers=["CPUExecutionProvider"])
+    assert session.get_inputs()[0].type == "tensor(float16)"
+    image = np.random.default_rng(0).random((1, 3, 16, 16)).astype(np.float16)
+    output = session.run(None, {session.get_inputs()[0].name: image})[0]
+    assert output.shape == (1, 3, 64, 64) and np.isfinite(output).all()
+
+
+@pytest.mark.parametrize("arch", FP16_ARCHS)
+def test_a_saved_onnx_of_an_fp16_architecture_keeps_its_record(arch: str):
+    saved = convert(tiny_model(arch))[0].bytes
+    assert {e.key: e.value for e in onnx.load_from_string(saved).metadata_props}[
+        ARCH_METADATA_KEY
+    ] == arch
+    loaded = load_onnx_model(saved)
+    assert loaded.info.arch == arch
+    fields = OnnxModelOutput().get_broadcast_type(loaded)["fields"]
+    assert fields["arch"] == {"type": "string-literal", "value": arch}
+
+
+def test_other_architectures_keep_their_data_type_and_record_nothing():
+    model = tiny_model("Compact")
+    onnx_model, fp_mode, _ = convert(model, OnnxDataType.FP32)
+    assert fp_mode == "fp32"
+    assert onnx_model.info.arch is None
+    assert "arch" not in OnnxModelOutput().get_broadcast_type(onnx_model)["fields"]
+    with pytest.raises(ValueError, match="fp16 mode must be supported"):
+        convert(model, OnnxDataType.FP16)
+
+
+def test_the_node_hides_data_type_alone_and_keeps_its_input_ids():
+    node = next(
+        n
+        for n in convert_to_onnx.utility_group.nodes
+        if n.schema_id == "chainner:pytorch:convert_to_onnx"
+    )
+    labels = {i.id: i.label for i in node.inputs}
+    assert (labels[1], labels[2], labels[3], labels[7]) == (
+        "Data Type",
+        "Opset",
+        "Verify",
+        "Calibration Image",
+    )
+    outer = next(
+        g
+        for g in node.group_layout
+        if not isinstance(g, int) and 2 in g.items and 3 in g.items
+    )
+    condition = str(outer.info.options["condition"])
+    assert '"DUAL"' in condition and "ESRGAN" not in condition
+    # Data Type and Calibration Image sit in groups of their own inside it.
+    inner = [g for g in outer.items if not isinstance(g, int)]
+    assert [g.items for g in inner] == [[1], [7]]
+    for group in inner:
+        condition = str(group.info.options["condition"])
+        assert all(arch in condition for arch in ('"DUAL"', *FP16_ARCHS))

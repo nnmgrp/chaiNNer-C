@@ -23,7 +23,7 @@ const build: BuildInfo = {
 const release = (version: GitHubRelease['version'], tree: string, date: string): GitHubRelease => ({
     version,
     name: `chaiNNer-C v${version}`,
-    url: `https://github.com/Rift73/chaiNNer-C/releases/tag/v${version}`,
+    url: `https://github.com/nnmgrp/chaiNNer-C/releases/tag/v${version}`,
     tree,
     date,
 });
@@ -85,11 +85,11 @@ test('the title of a re-release has its date', () => {
     );
 });
 
-const api = 'https://api.github.com/repos/Rift73/chaiNNer-C';
+const api = 'https://api.github.com/repos/nnmgrp/chaiNNer-C';
 const latestRelease = {
     tag_name: 'v0.3.5',
     name: 'chaiNNer-C v0.3.5',
-    html_url: 'https://github.com/Rift73/chaiNNer-C/releases/tag/v0.3.5',
+    html_url: 'https://github.com/nnmgrp/chaiNNer-C/releases/tag/v0.3.5',
 };
 const json = (data: unknown) => new Response(JSON.stringify(data));
 const tagCommit = (tree: string) => ({

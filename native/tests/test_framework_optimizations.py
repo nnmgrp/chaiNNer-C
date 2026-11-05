@@ -1042,6 +1042,9 @@ def test_registered_upscale_defers_collection_and_drains_once(backend, fail):
         execution_provider="CPUExecutionProvider",
         tensorrt_fp16_mode=False,
         tensorrt_cache_path="",
+        migraphx_fp16_mode=False,
+        migraphx_cache_path=None,
+        migraphx_exhaustive_tune=False,
     )
     path = f"packages/chaiNNer_{backend}/{backend}/processing/upscale_image.py"
     module = functions(
@@ -1050,7 +1053,9 @@ def test_registered_upscale_defers_collection_and_drains_once(backend, fail):
         get_settings=lambda _: settings,
         convenient_upscale=convenient,
         get_h_w_c=lambda image: image.shape,
-        get_onnx_session=lambda *args: object(),
+        get_onnx_session=lambda *args: SimpleNamespace(
+            get_inputs=lambda: [SimpleNamespace(type="tensor(float)")]
+        ),
         get_input_shape=lambda _: ("BCHW", 1, None, None),
         get_output_shape=lambda _: ("BCHW", 1, None, None),
         CUSTOM=-1,

@@ -2,7 +2,8 @@
 
 Checklists for the changes that touch the exactness contract, the build or the package. Why each rule exists:
 `DESIGN-DECISIONS.md`. Commands in full: `README.md`. Run everything in PowerShell from the repository root;
-`$py` is `.\native\.venv\Scripts\python.exe`, always run with `-B` (README Test sets the environment).
+`$py` is `.\native\.venv\Scripts\python.exe`, always run with `-B` (README Test sets the environment). What Linux
+adds to these procedures is in section 11.
 
 ## 1. Upgrade a Python dependency or the whole stack
 
@@ -62,8 +63,9 @@ Checklists for the changes that touch the exactness contract, the build or the p
 
 ## 4. Change compiler flags or the toolchain
 
-1. Versions are pinned once each: clang-cl in `native/CMakeLists.txt`, the MSVC toolset and Windows SDK in
-   `native/toolchain.cmake`; `package_port.py` reads them into the manifest's `native_toolchain`.
+1. Versions are pinned once each: clang-cl and the TensorRT and CUDA majors in `native/CMakeLists.txt`, the MSVC
+   toolset and Windows SDK in `native/toolchain.cmake`; `package_port.py` reads them into the manifest's
+   `native_toolchain`.
 2. Any codegen change (an LLVM bump, a new flag, PGO, `-mprefer-vector-width=512`): run
    `native/tests/test_spectral_filter.py::test_packed_spectrum_all_parities`, `test_golden_kernels.py` (`-k "tail or
    dither"` at least) and `test_forced_paths.py` under each `CHAINNER_C_ISA` level, then the full suite.
@@ -147,6 +149,11 @@ packaging (section 4, item 6; README Build). VOSR's modules, engine caches, host
    `CHAINNER_C_PACKAGE_WITHOUT_VOSR_PLUGIN=1` (exactly `1`) for that run. Legacy DRFT's plugin library
    `drft_trt_plugins.dll` builds from the same roots in the same configure (a failure of its target fails the
    build), so this check covers it; a package without it has no DRFT TensorRT route.
+6. A Windows release with the AMD GPU parts builds with `Build.ps1 -RocmRoot <ROCm 7.14 SDK> -MigraphxRoot <MIGraphX
+   2.16 install>` as well (`BUILDING.md`, AMD GPUs; the MIGraphX whose DLLs the published Windows `onnxruntime-migraphx`
+   wheel bundles): `nodes\impl\migraphx\_chainner_migraphx.pyd`, `drft_migx_ops.dll` and `vosr2_migx_ops.dll` ship
+   when built and are never required (`package_files.py`), and the other binaries keep the SHA-256 of a build without
+   the roots at the same path (`drft_trt_plugins.dll` depends on the checkout's path).
 
 ## 9. Publish
 
@@ -170,3 +177,91 @@ packaging (section 4, item 6; README Build). VOSR's modules, engine caches, host
    (`DIAGNOSTICS`, `bench.py`), the real-use chains under `C:\Executables\models\ESRGAN` (`MODELS`,
    `real_use_pass.py`), the growth dataset (`DATASET`, `numpy_pool_growth.py`), FFmpeg 8.1 and Node (README
    Prerequisites).
+
+## 11. Linux
+
+Linux adds these steps to the procedures above. Run them in bash from the repository root; the Linux binaries are `.so`
+files with the Windows names (`BUILDING.md`, Linux). `package_port.py` and `independent_ui.py` build the local Windows
+package from upstream's Windows nightly (sections 5, 6 and 8) and have no Linux counterpart: the Linux zip is Forge's
+(`npm run make-linux-zip`).
+
+1. **Both platforms.** A file that both compile keeps its Windows statements as they are, and its Linux code goes in
+   the `#else` branch (`if(NOT WIN32)` in CMake). Build on Windows as well as on Linux for such a change, and run the
+   Windows tests that name the file.
+2. **Python stack (sections 1 and 2).** `native/python-stack.lock.linux.txt` is the Windows set without `colorama`, plus
+   PyTorch's CUDA libraries and Triton, `cuda-bindings`, `uvloop` and `ujson`. Change the install list (`packages`) and
+   the torch line in `native/tools/provision_runtime.sh` together with `provision_runtime.ps1`'s, so that both locks
+   stay one stack, then `native/tools/provision_runtime.sh --relock` (a CPython upgrade adds
+   `--version <x.y.z> --tag <build tag>`) and review the diff. The `Dependency` pins in
+   `backend/src/packages/*/__init__.py` serve both platforms; `chaiNNer_tensorrt` alone differs, with `triton` where
+   Windows has `triton-windows`. `package_manifest.LOCK`, `verify_runtime.py` and the oracle read the Windows lock
+   only. A CPython upgrade also changes the Linux URL in `src/main/python/integratedPython.ts` and the CPython step of
+   `native/linux/Dockerfile` (URL and SHA-256). NumPy's Linux wheels dispatch AVX-512 loops its Windows wheels lack,
+   and the C mirrors follow the Windows ones, so Linux workers set
+   `NPY_DISABLE_CPU_FEATURES="X86_V4 AVX512_ICL AVX512_SPR"` unless the user set it (`backend/src/worker_spawn.py`):
+   after a NumPy upgrade, check that these names still switch the new wheel's AVX-512 loops off.
+3. **Golden twins (section 3).** The manifests of the kernels that call the C library's math (`LIBM_KERNELS` in
+   `native/tools/golden_kernels.py`: `lens_power` and `resample`) were recorded from `ucrtbase.dll`. On Linux those
+   kernels follow the process's libm, as NumPy and CPython do, so `native/tests/golden/linux/<kernel>.json`, the
+   kernel's Linux twin, holds the cases whose outputs differ, and the golden tests read its outputs in place of the
+   manifest's (`load_expected`). Windows reads the manifest alone, and a manifest is never edited for Linux. After a
+   change to such a kernel or to the math functions it calls, build on Linux, check that the kernel's live comparisons
+   with its Python reference pass (the twin records what that reference gives there), then:
+   `python native/tools/golden_kernels.py twin --dll backend/src/nodes/impl/chainner_native.so --kernel <kernel>`. It
+   refuses when the ISA levels disagree and records the glibc version in the twin. Another glibc can round otherwise:
+   a twin that fails on another distribution is a finding to look into, not a file to rewrite.
+   Other comparisons against NumPy or OpenCV differ on Linux where their GCC builds do (OpenCV's AVX2 code contracts
+   multiply-adds into FMA, NumPy converts NaN and out-of-range floats to integers otherwise);
+   `native/tests/linux_differences.json` lists the tests that Linux skips for that reason. To refresh it, record each
+   system's comparisons (with `native/tools` on `PYTHONPATH`, as `run_tests.py` sets it), then list:
+
+   ```bash
+   LINUX_DIFFERENCES_RECORD=windows.json python -m pytest -p linux_differences @ids.txt   # on Windows
+   LINUX_DIFFERENCES_RECORD=linux.json python -m pytest -p linux_differences @ids.txt     # on Linux
+   python native/tools/linux_differences.py list windows.json linux.json
+   ```
+
+4. **Compiler and flags (section 4).** The flags are in `native/toolchain-linux.cmake` and `native/cmake/linux.cmake`,
+   which writes every clang-cl option of the CMake files in clang's spelling at the end of configuration and stops the
+   configure on one it does not know: a new Windows option needs a mapping there or an `if(WIN32)` block. LLVM 23.1.2
+   is pinned in `native/CMakeLists.txt` and `native/toolchain-linux.cmake`. Keep `-ffp-model=strict`,
+   `-fdenormal-fp-math=dynamic`, the `-ffile-prefix-map` and math errno (clang-cl's `/fp:strict` keeps it). `sqrt` and
+   `sqrtf` reach `native/src/ucrt_sqrt.c`, compiled outside ThinLTO, which gives the static UCRT's results and flags
+   because glibc's differ under DAZ. Check reproducibility by building twice in clean directories and comparing the
+   modules' SHA-256. The TensorRT parts follow section 4, item 6 with `.so` names; nvcc's host compiler is `g++`
+   (`CHAINNER_C_NVCC_HOST`), since nvcc 13 refuses clang 23.
+5. **Image pins (sections 7 and 8).** `native/linux/Dockerfile` pins every download by version and SHA-256
+   (`native/linux/fetch.sh <url> <sha256> <file>` fails and removes the file on a mismatch): the base image by digest,
+   Ubuntu's packages by the `UBUNTU_SNAPSHOT` date, and LLVM, CMake, Ninja, NASM, CPython with NumPy's hash, Node, the
+   CUDA redistributables, the TensorRT packages, VapourSynth's header and the Rocky Linux 8.10 packages of the glibc
+   2.28 sysroot (their file names carry their versions). To refresh a pin, change its version and hash together, run
+   `native/tools/build_linux_release.sh`, and read `check_glibc.py`'s result. Keep the image equal to the Windows build
+   where Windows pins the same tool: LLVM 23.1.2, the CUDA 13 and TensorRT 11 majors (`CMakeLists.txt`) and TensorRT's
+   version (`chaiNNer_tensorrt`), CMake, Ninja, NASM 3.01, Node 24 (`.nvmrc`), and the lock's CPython and NumPy. Once
+   Rocky 8.10 leaves the main mirror, set the `ROCKY_MIRROR` default to `https://dl.rockylinux.org/vault/rocky/8.10`.
+   texconv's sources are the one download outside the image: the configure fetches them into the build directory,
+   pinned the same way in `native/texconv/CMakeLists.txt` (item 8).
+6. **Release (section 8).** `native/tools/build_linux_release.sh --ref <commit>` builds that commit in the image,
+   checks `backend/src` and the packaged app with `check_glibc.py`, makes the zip and prints the SHA-256 of the zip and
+   of every module (`native/README.md`'s hash table lists the Windows binaries). A release with the AMD GPU parts adds
+   `--rocm <ROCm 7.14 SDK root> --migraphx <MIGraphX 2.16 prefix>` (`BUILDING.md`, Linux); the modules the build had
+   without them keep their SHA-256, which a build of the same commit without the two options shows. DRFT's MIGraphX ops,
+   `nodes/impl/migraphx/drft_migx_ops.so`, are built whenever the ROCm root is given and ship with them. Forge names the
+   zip from `package.json`'s version (`chaiNNer-linux-x64-<version>.zip`): give it the release's name before attaching
+   it (section 9, step 4).
+7. **Tests (section 10).** On Linux, from a checkout on a Linux file system with the natives built
+   (`native/build_linux.sh`), with `PYTHONNOUSERSITE=1`, scratch `APPDATA` and `TMPDIR`, and the pinned Linux FFmpeg
+   first on `PATH`: `<runtime>/bin/python3 -B native/tools/run_tests.py --workers 3 --deselect
+   native/tests/test_matting_complete.py` (`run_tests.py` sets `NPY_DISABLE_CPU_FEATURES` there). Cases whose Linux
+   reference library rounds differently from the Windows build are listed with their reason in
+   `native/tests/linux_differences.json`; both conftests skip them on Linux.
+8. **texconv (DDS).** Linux runs `native/texconv` where Windows runs `backend/src/texconv/texconv.exe` (DirectXTex's
+   release binary): texconv's steps for the options chaiNNer passes, on the same DirectXTex release, with texconv.exe's
+   WIC steps and MSVC `/fp:fast` arithmetic rebuilt from measurements (`wic.cpp`, `bc4_unorm_gradient.h`, the
+   DirectXTex compile options). `native/tests/test_texconv.py` compares both with `native/tests/golden/texconv.json`,
+   texconv.exe's results for chaiNNer's command lines. A texconv.exe update moves the DirectXTex tag and SHA-256 in
+   `native/texconv/CMakeLists.txt` to that release (the configure stops when BC4BC5.cpp's patched line moved), then
+   re-records the golden file on Windows (`native\.venv\Scripts\python.exe -B native/tools/texconv_golden.py`), runs
+   the test on both systems, and lists the cases WIC decides that the rebuild misses in `linux_differences.json`
+   (groups `texconv-wic-*`). A new texconv option in `native/src/image_io.cpp` needs its counterpart in `texconv.cpp`,
+   which refuses options it does not know.

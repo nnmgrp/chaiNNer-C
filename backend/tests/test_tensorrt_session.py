@@ -124,12 +124,14 @@ class _Loaded(DeserializedEngine):
 
 def _fake_tensorrt() -> ModuleType:
     trt = ModuleType("tensorrt")
-    trt.DataType = SimpleNamespace(FLOAT="FLOAT", HALF="HALF", BF16="BF16")
-    trt.nptype = lambda _dtype: np.float32
-    trt.ExecutionContextAllocationStrategy = SimpleNamespace(USER_MANAGED=1)
-    trt.TensorIOMode = SimpleNamespace(INPUT="INPUT", OUTPUT="OUTPUT")
     severity = SimpleNamespace(INTERNAL_ERROR=0, ERROR=1, WARNING=2, INFO=3, VERBOSE=4)
-    trt.ILogger = type("ILogger", (), {"Severity": severity})
+    trt.__dict__.update(
+        DataType=SimpleNamespace(FLOAT="FLOAT", HALF="HALF", BF16="BF16"),
+        nptype=lambda _dtype: np.float32,
+        ExecutionContextAllocationStrategy=SimpleNamespace(USER_MANAGED=1),
+        TensorIOMode=SimpleNamespace(INPUT="INPUT", OUTPUT="OUTPUT"),
+        ILogger=type("ILogger", (), {"Severity": severity}),
+    )
     return trt
 
 
@@ -142,8 +144,8 @@ def cudart() -> _Cudart:
 def inference(monkeypatch: pytest.MonkeyPatch, cudart: _Cudart) -> ModuleType:
     cuda = ModuleType("cuda")
     bindings = ModuleType("cuda.bindings")
-    cuda.bindings = bindings
-    bindings.runtime = cudart
+    cuda.__dict__["bindings"] = bindings
+    bindings.__dict__["runtime"] = cudart
     for name, module in (
         ("tensorrt", _fake_tensorrt()),
         ("cuda", cuda),
@@ -293,3 +295,19 @@ def test_planes_reach_the_engine_in_rgb_order_and_return_bgr(
     weights[order] = np.arange(1, channels + 1, dtype=np.float32)
     expected = image.repeat(2, 0).repeat(2, 1) * weights
     np.testing.assert_array_equal(out, expected)
+
+
+def test_a_grey_image_reaches_a_one_channel_engine(inference: ModuleType):
+    # chaiNNer holds a grey image as HxW, which the session takes as one plane.
+    from nodes.impl.tensorrt.tiling import tiled_upscale
+
+    loaded = DeserializedEngine(object(), _WeightingEngine(1), 0)
+    shape = (1, 1, 64, 64)
+    info = TensorRTEngineInfo(
+        "fp32", 1, 1, 2, "sm_120", "11", True, shape, shape, shape
+    )
+    session = inference.TensorRTSession(TensorRTEngine(b"engine", info, loaded), 0)
+    image = np.random.default_rng(32).random((40, 50), np.float32)
+    out = tiled_upscale(image, 2, session.bounds, session)
+    session.close()
+    np.testing.assert_array_equal(out, image.repeat(2, 0).repeat(2, 1))

@@ -45,6 +45,22 @@ class SizeReq:
         return w - width, h - height
 
 
+# The ONNX metadata key of the size requirement Convert To ONNX records from the PyTorch
+# model (spandrel's minimum and multiple_of, as JSON), which ONNX Upscale Image pads
+# each tile to as PyTorch pads the model's input (size_probe.py). A square requirement
+# is not recorded: the export's graph pads to it (spandrel traces that padding).
+SIZE_REQ_METADATA_KEY = "chainner_c.size_requirements"
+
+# The architectures (spandrel's ids, which are also their names) that convert and build
+# in FP16 with no precision choice.
+FP16_ARCHS: Final = ("ESRGAN", "HAT", "DAT")
+# The same, as a navi union of strings
+FP16_ARCHS_NAVI: Final = " | ".join(f'"{arch}"' for arch in FP16_ARCHS)
+# The ONNX metadata key of the architecture Convert To ONNX records for FP16_ARCHS, so
+# that a saved ONNX loaded later builds with no precision choice too (load.py).
+ARCH_METADATA_KEY = "chainner_c.architecture"
+
+
 # The dtype of a DUAL or legacy DRFT ONNX from Convert To ONNX (a BF16 or FP16 body, FP32
 # input and output), whose precision is its own (load.py).
 MIXED = "mixed"
@@ -65,6 +81,10 @@ class OnnxInfo:
     output_channels: int | None = None
 
     size_req: SizeReq = field(default_factory=SizeReq)
+
+    # The architecture Convert To ONNX recorded (one of FP16_ARCHS); None for any other
+    # ONNX. Set by load_onnx_model, as the native loader passes a fixed set of arguments.
+    arch: str | None = None
 
 
 class OnnxGeneric:

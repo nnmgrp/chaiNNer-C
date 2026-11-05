@@ -16,7 +16,7 @@ from ..native_framework_images import planar_to_interleaved_checked
 from ..upscale.auto_split import Split, Tiler, auto_split
 from ..upscale.bounded_tiler import BoundedTiler
 from .offload import offloaded
-from .utils import safe_cuda_cache_empty
+from .utils import on_device, safe_cuda_cache_empty
 
 
 class _Stopped(Exception):
@@ -124,6 +124,28 @@ def _into_tensor(
         img.flags.writeable = writeable
 
 
+# Architectures measured at least 5 % slower on the CPU in FP32 with a channels-last
+# input (default networks at 128 px): they keep NCHW.
+_NCHW_ON_CPU = frozenset({"MixDehazeNet"})
+
+
+def _channels_last_input(
+    model: ImageModelDescriptor[torch.nn.Module],
+    device: torch.device,
+    dtype: torch.dtype,
+    use_bf16: bool,
+) -> bool:
+    """Whether the forward gets its input in channels-last order: on the CPU in FP32
+    and in BF16. oneDNN's convolutions on NCHW reorder each layer's input and output;
+    in channels-last order they run on them directly (a 4x ESRGAN 1.5x faster, in FP32
+    as in BF16). GPUs and FP16 keep NCHW."""
+    return use_bf16 or (
+        device.type == "cpu"
+        and dtype == torch.float32
+        and model.architecture.id not in _NCHW_ON_CPU
+    )
+
+
 def _is_finite(img: np.ndarray) -> bool:
     # NaN propagates through min and max: two passes and no temporary array
     return math.isfinite(img.min()) and math.isfinite(img.max())
@@ -158,10 +180,13 @@ def pytorch_auto_split(
     tiler: Tiler,
     progress: Progress,
     overlap: int = 16,
+    use_bf16: bool = False,
 ) -> np.ndarray:
+    """`use_bf16` runs an FP32 model's forward in BF16 on the CPU (autocast: the
+    weights stay FP32)."""
     dtype = torch.float16 if use_fp16 else torch.float32
-    if model.dtype != dtype or model.device != device:
-        model = model.to(device, dtype)
+    model = on_device(model, device, dtype)
+    channels_last = _channels_last_input(model, device, dtype, use_bf16)
 
     def upscale(img: np.ndarray, _: object):
         progress.check_aborted()
@@ -176,9 +201,15 @@ def pytorch_auto_split(
             input_tensor = _into_tensor(img, device, dtype)
             input_tensor = _rgb_to_bgr(input_tensor)
             input_tensor = _into_batched_form(input_tensor)
+            if channels_last:
+                # A copy: the batched form is channels-last in memory, but its batch
+                # stride makes PyTorch take it for NCHW.
+                input_tensor = input_tensor.clone(memory_format=torch.channels_last)
 
             # inference; activations past the GPU's memory go to RAM, not the driver's overflow
-            with offloaded(model.model, input_tensor):
+            with offloaded(model.model, input_tensor), torch.autocast(
+                "cpu", torch.bfloat16, enabled=use_bf16
+            ):
                 output_tensor = _forward_or_stopped(model, input_tensor, progress)
             if output_tensor is None:
                 # The kernels already queued end inside the node, so the memory is
@@ -234,6 +265,11 @@ def pytorch_auto_split(
                 message += (
                     " Models can overflow in FP16: turn off 'Use FP16 Mode' in the"
                     " PyTorch settings to run this model in FP32."
+                )
+            if use_bf16:
+                message += (
+                    " Models can lose precision in BF16: turn off 'Use BF16 Mode (CPU)'"
+                    " in the PyTorch settings to run this model in FP32."
                 )
             raise RuntimeError(message)
         return result

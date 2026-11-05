@@ -1,12 +1,51 @@
+from __future__ import annotations
+
 import os
 
 from sanic.log import logger
 
 from api import GB, KB, MB, Dependency, add_package
+from dependencies.rocm import (
+    PYTORCH_ROCM_INDEX,
+    TORCH_AMD_BUILDS,
+    TORCHVISION_AMD_BUILDS,
+    gpu_architectures,
+    rocm_runtime,
+    triton_rocm,
+    windows_wheel,
+)
 from gpu import nvidia
-from system import is_arm_mac
+from system import is_arm_mac, is_linux, is_windows
 
 general = "PyTorch uses .pth models to upscale images."
+
+# AMD's Windows build of PyTorch on ROCm 7.14.1 (the newest it has; Linux runs 2.14.1), by
+# the pinned URLs of dependencies.rocm.WINDOWS_WHEELS. A GPU needs its architecture's PyTorch
+# kernels and, for RDNA 3, 3.5 and 4, its family's flash attention kernels: what torch's
+# device-gfx<arch> extra names, never its device-all.
+WINDOWS_ROCM_TORCH = "2.12.0+rocm7.14.1"
+WINDOWS_ROCM_TORCHVISION = "0.27.0+rocm7.14.1"
+WINDOWS_TORCH_FAMILIES = {
+    "gfx1100": "gfx110x",
+    "gfx1101": "gfx110x",
+    "gfx1102": "gfx110x",
+    "gfx1103": "gfx110x",
+    "gfx1150": "gfx115x",
+    "gfx1151": "gfx115x",
+    "gfx1152": "gfx115x",
+    "gfx1153": "gfx115x",
+    "gfx1200": "gfx12-0",
+    "gfx1201": "gfx12-0",
+}
+
+
+def amd_architectures() -> tuple[list[str], list[str]]:
+    """The AMD GPUs' architectures PyTorch runs on with ROCm, and the others; none where
+    an NVIDIA GPU is found (CUDA is chosen) or on macOS."""
+    if nvidia.is_available or not (is_linux or is_windows):
+        return [], []
+    return gpu_architectures()
+
 
 if is_arm_mac:
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -14,13 +53,63 @@ if is_arm_mac:
     inst_hint = f"{general} It is the most widely-used upscaling architecture."
 else:
     package_description = (
-        f"{general} and is fastest when CUDA is supported (Nvidia GPU). If CUDA is"
-        " unsupported, it will install with CPU support (which is very slow)."
+        f"{general} It is fastest when CUDA (Nvidia GPU) or ROCm (AMD GPU) is supported."
+        " Otherwise, it will install with CPU support (which is very slow)."
     )
-    inst_hint = (
-        f"{general} It is the most widely-used upscaling architecture. However, it does"
-        " not support AMD GPUs."
-    )
+    inst_hint = f"{general} It is the most widely-used upscaling architecture."
+    _supported, _unsupported = amd_architectures()
+    if _unsupported and not _supported:
+        package_description += (
+            " ROCm has no GPU kernels for this computer's AMD GPU"
+            f" ({', '.join(_unsupported)}), so it installs with CPU support."
+        )
+
+
+def get_pytorch_rocm(architectures: list[str]) -> list[Dependency]:
+    """PyTorch on ROCm with the GPU kernels of the architectures: PyTorch's build on
+    Linux, AMD's on Windows."""
+    if is_windows:
+        families = sorted(
+            {
+                WINDOWS_TORCH_FAMILIES[a]
+                for a in architectures
+                if a in WINDOWS_TORCH_FAMILIES
+            }
+        )
+        return [
+            windows_wheel("PyTorch", "torch", WINDOWS_ROCM_TORCH),
+            windows_wheel("TorchVision", "torchvision", WINDOWS_ROCM_TORCHVISION),
+            windows_wheel("ROCm bootstrap", "rocm-bootstrap", "0.1.0"),
+            *(
+                windows_wheel(
+                    f"PyTorch GPU kernels ({name})",
+                    f"amd-torch-device-{name}",
+                    WINDOWS_ROCM_TORCH,
+                )
+                for name in [*architectures, *families]
+            ),
+            *rocm_runtime(architectures),
+        ]
+    return [
+        Dependency(
+            display_name="PyTorch",
+            pypi_name="torch",
+            version="2.14.1+rocm7.14",
+            size_estimate=1329.2 * MB,
+            extra_index_url=PYTORCH_ROCM_INDEX,
+            auto_update=False,
+        ),
+        Dependency(
+            display_name="TorchVision",
+            pypi_name="torchvision",
+            version="0.29.1+rocm7.14",
+            size_estimate=3.3 * MB,
+            extra_index_url=PYTORCH_ROCM_INDEX,
+            auto_update=False,
+        ),
+        triton_rocm(),
+        *rocm_runtime(architectures),
+    ]
 
 
 def get_pytorch():
@@ -41,6 +130,8 @@ def get_pytorch():
                 auto_update=False,
             ),
         ]
+    elif rocm_architectures := amd_architectures()[0]:
+        return get_pytorch_rocm(rocm_architectures)
     else:
         # Determine CUDA version based on GPU architecture
         # Volta and older need CUDA 12.6 (CUDA 13 dropped Maxwell, Pascal and Volta),
@@ -63,6 +154,7 @@ def get_pytorch():
                 size_estimate=2 * GB if nvidia.is_available else 140 * MB,
                 extra_index_url=cuda_url,
                 auto_update=False,
+                replaces=TORCH_AMD_BUILDS,
             ),
             Dependency(
                 display_name="TorchVision",
@@ -71,6 +163,7 @@ def get_pytorch():
                 size_estimate=2 * MB if nvidia.is_available else 800 * KB,
                 extra_index_url=cuda_url,
                 auto_update=False,
+                replaces=TORCHVISION_AMD_BUILDS,
             ),
         ]
 
@@ -110,13 +203,17 @@ package = add_package(
             # through scaled_dot_product_attention (cuDNN or memory-efficient attention);
             # c7 folds DRFT's edge branches without a per-channel Python loop; c8 adds
             # WSR, GaterV3, SMoSR, FIGSR and GFISRv2; c9 loads released GaterV3 models
-            # (no flash buffer, resselt's upsamplers).
-            version="0.4.2+c9",
-            size_estimate=577 * KB,
+            # (no flash buffer, resselt's upsamplers); c10 runs DUAL's context layers
+            # as neighborhood attention; c11 exports HAT's and DAT's attention in the
+            # layout MIGraphX fuses, on request; c12 runs depthwise 3x3 convolutions
+            # and ESRGAN's dense blocks on HIP kernels under ROCm; c13 runs DUAL's
+            # inference with fewer passes over memory.
+            version="0.4.2+c13",
+            size_estimate=600 * KB,
             url=(
-                "https://github.com/Rift73/spandrel/releases/download/v0.4.2-c9/"
-                "spandrel-0.4.2%2Bc9-py3-none-any.whl"
-                "#sha256=0e3c202241257be9e0bfbfc1ede161944d829291510768eea97b68bf8bd4094e"
+                "https://github.com/Rift73/spandrel/releases/download/v0.4.2-c13/"
+                "spandrel-0.4.2%2Bc13-py3-none-any.whl"
+                "#sha256=20e149794cf16a4f4fbb2930173ffca3ad5264fa585c1acf1c672e019e418950"
             ),
         ),
         Dependency(

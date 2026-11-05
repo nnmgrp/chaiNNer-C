@@ -8,6 +8,8 @@ import subprocess
 import sys
 from collections import deque
 from dataclasses import dataclass
+from functools import cache
+from types import ModuleType
 from typing import TYPE_CHECKING, Iterable
 
 from custom_types import UpdateProgressFn
@@ -20,13 +22,23 @@ if TYPE_CHECKING:
 
 python_path = sys.executable
 dir_path = os.path.dirname(os.path.realpath(__file__))
+# chainner_pip with the fix for wheels it downloaded twice
+run_chainner_pip = os.path.join(dir_path, "run_chainner_pip.py")
 
 installed_packages: dict[str, str] = {}
 
 COLLECTING_REGEX = re.compile(r"Collecting ([a-zA-Z0-9-_]+)")
+# The package of a file pip downloads, from the file's name (name-version...), as in
+# "Downloading https://download.pytorch.org/whl/cu132/torch-2.14.1%2Bcu132-...whl"
+DOWNLOADING_REGEX = re.compile(r"Downloading (?:\S*/)?([^/\s]+?)-\d")
 UNINSTALLING_REGEX = re.compile(r"Uninstalling ([a-zA-Z0-9-_]+)-+")
 
 DEP_MAX_PROGRESS = 0.8
+
+# Never uninstalled as a dependency nothing needs (unneeded_dependencies): the
+# installer, and NumPy and SciPy, which chaiNNer-C's code imports without a package
+# that lists them.
+KEPT_DISTRIBUTIONS = frozenset({"pip", "setuptools", "wheel", "numpy", "scipy"})
 
 # How many of pip's last output lines a failed run's message can carry.
 PIP_REASON_LINES = 10
@@ -51,6 +63,8 @@ class DependencyInfo:
     from_file: str | None = None
     extra_index_url: str | None = None
     url: str | None = None
+    # The distributions it replaces (api.Dependency.replaces)
+    replaces: tuple[str, ...] = ()
 
     @property
     def distribution(self) -> str:
@@ -63,6 +77,27 @@ def distribution_name(package_name: str) -> str:
     names (PEP 503), since pip lists a package by the spelling in its own metadata:
     "onnx_graphsurgeon" for onnx-graphsurgeon."""
     return re.sub(r"[-_.]+", "-", package_name.split("[", 1)[0]).lower()
+
+
+@cache
+def _version_module() -> ModuleType:
+    """packaging's version module. A fresh Python has no packaging until the server's
+    dependencies are installed, and the installed packages are listed before that: the
+    pip every Python chaiNNer-C runs has carries the same module."""
+    try:
+        return importlib.import_module("packaging.version")
+    except ModuleNotFoundError:
+        return importlib.import_module("pip._vendor.packaging.version")
+
+
+def listed_version(version: str) -> str:
+    """The version as pip lists it: in packaging's canonical form, so "v17.1" is 17.1
+    and "1.0RC1" is 1.0rc1. A version that is not one stays as the metadata has it."""
+    versions = _version_module()
+    try:
+        return str(versions.Version(version))
+    except versions.InvalidVersion:
+        return version
 
 
 def scan_installed_packages() -> None:
@@ -79,7 +114,9 @@ def scan_installed_packages() -> None:
         metadata = distribution.metadata
         name = metadata["Name"]
         if name:
-            found.setdefault(distribution_name(name), metadata["Version"])
+            found.setdefault(
+                distribution_name(name), listed_version(metadata["Version"])
+            )
     installed_packages.clear()
     installed_packages.update(found)
 
@@ -112,6 +149,23 @@ def coerce_semver(version: str) -> tuple[int, int, int]:
     return (0, 0, 0)
 
 
+def replaced(replaces: Iterable[str], name: str, version: str) -> bool:
+    """Whether the installed distribution `name` (as pip lists it) at `version` is one
+    of the builds `replaces` names (api.Dependency.replaces): a distribution, any of its
+    builds, or "<distribution>+<label>", its builds whose local version label starts
+    with label ("torch+rocm": torch 2.14.1+rocm7.14, not 2.14.1+cu132 or 2.14.1). A
+    distribution ending in "*" names every distribution whose name starts with the rest
+    ("rocm-sdk-device-*": rocm-sdk-device-gfx1100)."""
+    for entry in replaces:
+        distribution, _, label = entry.partition("+")
+        pattern = distribution_name(distribution)
+        if (
+            name.startswith(pattern[:-1]) if pattern.endswith("*") else name == pattern
+        ) and version.partition("+")[2].startswith(label):
+            return True
+    return False
+
+
 def filter_necessary_to_install(dependencies: Iterable[DependencyInfo]):
     """
     Filters out dependencies that are already installed and have the same or higher version.
@@ -123,14 +177,154 @@ def filter_necessary_to_install(dependencies: Iterable[DependencyInfo]):
             installed_version = coerce_semver(version)
             dep_version = coerce_semver(dependency.version)
             # A local label (spandrel 0.4.2+c2, the fork's build) is a different
-            # build of the same numbers: only that exact version satisfies it.
-            if installed_version < dep_version or (
-                "+" in dependency.version and version != dependency.version
+            # build of the same numbers: only that exact version satisfies it. An
+            # installed build the dependency replaces never does (PyTorch's ROCm
+            # build where the CPU build is listed).
+            if (
+                installed_version < dep_version
+                or ("+" in dependency.version and version != dependency.version)
+                or replaced(dependency.replaces, dependency.distribution, version)
             ):
                 dependencies_to_install.append(dependency)
         elif not version:
             dependencies_to_install.append(dependency)
     return dependencies_to_install
+
+
+def replaced_distributions(
+    dependencies: Iterable[DependencyInfo],
+) -> list[DependencyInfo]:
+    """The installed distributions the dependencies replace: other builds of their
+    modules under another name (onnxruntime-gpu for onnxruntime-migraphx), builds of
+    their own distribution they name by local label (PyTorch's ROCm build), and what
+    only the replaced builds ran on (ROCm's runtime). pip would install over the first's
+    files and keep both listed, and a later uninstall of either would delete files the
+    other needs; it would keep the second where the dependency's version names no label
+    (torch==2.14.1 is met by 2.14.1+rocm7.14) and never remove the third. So the
+    installer uninstalls them first."""
+    names = sorted(
+        {
+            name
+            for dep in dependencies
+            if dep.replaces
+            for name, version in installed_packages.items()
+            if replaced(dep.replaces, name, version)
+        }
+    )
+    return [
+        DependencyInfo(package_name=name, version=installed_packages[name])
+        for name in names
+    ]
+
+
+def unneeded_dependencies(
+    leaving: Iterable[DependencyInfo], keep: Iterable[str]
+) -> list[DependencyInfo]:
+    """The installed distributions pip pulled in for `leaving` that nothing staying
+    installed needs, for an uninstall to remove with them: their requirements (with
+    the extras `leaving` names), followed through their own, except what a
+    distribution staying installed requires (under any of its extras), what shares a
+    file with one (or has no RECORD), what was installed by name (pip's REQUESTED
+    mark: chaiNNer-C's server packages, the user's own installs), KEPT_DISTRIBUTIONS
+    and `keep` (distribution names: what chaiNNer-C lists itself). Raises ValueError for a requirement that cannot be read: what its
+    distribution needs is unknown."""
+    # pip's own reading of requirements, as pip installed them.
+    from pip._vendor.packaging.requirements import Requirement
+
+    found: dict[str, importlib.metadata.Distribution] = {}
+    for distribution in importlib.metadata.distributions():
+        name = distribution.metadata["Name"]
+        if name:
+            found.setdefault(distribution_name(name), distribution)
+
+    def required(
+        distribution: importlib.metadata.Distribution, extras: frozenset[str] | None
+    ) -> dict[str, frozenset[str]]:
+        """The installed distributions it requires on this Python, each with the
+        extras it asks for; with the given extras, or under any of its own (None)."""
+        if extras is None:
+            extras = frozenset(distribution.metadata.get_all("Provides-Extra") or ())
+        names: dict[str, frozenset[str]] = {}
+        for text in distribution.requires or ():
+            requirement = Requirement(text)
+            marker = requirement.marker
+            if marker is not None and not any(
+                marker.evaluate({"extra": extra}) for extra in ("", *extras)
+            ):
+                continue
+            name = distribution_name(requirement.name)
+            if name in found:
+                names.setdefault(name, frozenset(requirement.extras))
+        return names
+
+    removing = {dep.distribution for dep in leaving}
+    pulled: dict[str, frozenset[str]] = {}
+    pending = [
+        (dep.distribution, frozenset(Requirement(dep.package_name).extras))
+        for dep in leaving
+        if dep.distribution in found
+    ]
+    while pending:
+        name, extras = pending.pop()
+        for dependency, its_extras in required(found[name], extras).items():
+            if dependency not in removing and dependency not in pulled:
+                pulled[dependency] = its_extras
+                pending.append((dependency, its_extras))
+    needs = {
+        name: set(required(distribution, None))
+        for name, distribution in found.items()
+        if name not in removing
+    }
+
+    def files(distribution: importlib.metadata.Distribution) -> frozenset[str] | None:
+        """The files its RECORD lists, outside metadata folders; None without one."""
+        listed = distribution.files
+        if listed is None:
+            return None
+        return frozenset(
+            os.path.normcase(os.path.normpath(str(path)))
+            for path in listed
+            if not path.parts[0].endswith((".dist-info", ".egg-info"))
+        )
+
+    # The distributions that list each file, but `leaving`.
+    owners: dict[str, set[str]] = {}
+    for name, distribution in found.items():
+        if name not in removing:
+            for path in files(distribution) or ():
+                owners.setdefault(path, set()).add(name)
+    kept = KEPT_DISTRIBUTIONS.union(keep)
+    records = {
+        name: files(found[name])
+        for name in pulled
+        if name not in kept and found[name].read_text("REQUESTED") is None
+    }
+    # Without a RECORD, what an uninstall would delete is unknown: it stays.
+    unneeded = {name for name, record in records.items() if record is not None}
+    # Down to what no distribution that stays (all but these and `leaving`) needs,
+    # and what shares no file with one: pip deletes every file of a RECORD, and
+    # urllib3-future (vs-jetpack's niquests) installs into urllib3's folder, over 30
+    # of urllib3's own files, which requests needs.
+    while needed := {
+        dependency
+        for name, dependencies in needs.items()
+        if name not in unneeded
+        for dependency in dependencies
+        if dependency in unneeded
+    } | {
+        name
+        for name in unneeded
+        if any(
+            owner != name and owner not in unneeded
+            for path in records[name] or ()
+            for owner in owners[path]
+        )
+    }:
+        unneeded -= needed
+    return [
+        DependencyInfo(package_name=name, version=found[name].version)
+        for name in sorted(unneeded)
+    ]
 
 
 def extra_index_args(dependencies: Iterable[DependencyInfo]) -> list[str]:
@@ -176,6 +370,7 @@ def install_dependencies_sync(
     if len(dependencies_to_install) == 0:
         return 0
 
+    uninstall_dependencies_sync(replaced_distributions(dependencies_to_install))
     try:
         subprocess.check_call(
             [
@@ -212,6 +407,10 @@ async def install_dependencies(
     if len(dependencies_to_install) == 0:
         return 0
 
+    await uninstall_dependencies(
+        replaced_distributions(dependencies_to_install), update_progress_cb, logger
+    )
+
     dependency_name_map = {
         dep_info.distribution: dep_info.display_name or dep_info.package_name
         for dep_info in dependencies_to_install
@@ -232,9 +431,8 @@ async def install_dependencies(
         process = subprocess.Popen(
             [
                 python_path,
-                "-m",
                 # TODO: Change this back to "pip" once pip updates with my changes
-                "chainner_pip",
+                run_chainner_pip,
                 "install",
                 *[pin(dep_info) for dep_info in dependencies_to_install],
                 "--disable-chainner_pip-version-check",
@@ -287,6 +485,14 @@ async def install_dependencies(
             # Later, we can use this to get the progress of the download.
             # For now, we just tell the user that it's happening.
             elif "Downloading" in line:
+                # pip downloads the wheels it resolved from metadata files after the
+                # last Collecting step, so the file names the package.
+                match = DOWNLOADING_REGEX.search(line)
+                if match:
+                    package_name = match.group(1)
+                    installing_name = dependency_name_map.get(
+                        distribution_name(package_name), package_name
+                    )
                 await update_progress_cb(
                     f"Downloading {installing_name}...",
                     get_progress_amount() + dep_small_incr,
