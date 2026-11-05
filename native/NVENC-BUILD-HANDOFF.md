@@ -132,7 +132,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 180
 
     steps:
@@ -144,35 +144,47 @@ jobs:
           git log -2 --oneline
           git status --short
 
-      - name: Install pinned VS 2022 17.14.0 Build Tools
+      - name: Setup MSVC 14.44 and Windows SDK
         shell: pwsh
         run: |
-          $installer = 'C:\Executables\vs_BuildTools_17.14.0.exe'
-          New-Item -ItemType Directory -Force C:\Executables | Out-Null
-          Invoke-WebRequest `
-            'https://download.visualstudio.microsoft.com/download/pr/f50ab15d-99d5-43aa-b0b4-496b6cb1e574/8e8630e8383f68b7d2110c409dc7b2df6ae3ac92254612952eeb6a1e40207105/vs_BuildTools.exe' `
-            -OutFile $installer
-          & $installer --quiet --wait --norestart --nocache `
-            --installPath 'C:\BuildTools' `
-            --add Microsoft.VisualStudio.Workload.VCTools `
-            --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            --add Microsoft.VisualStudio.Component.Windows11SDK.26100 `
-            --includeRecommended
-          if ($LASTEXITCODE -notin 0, 3010) { throw "VS installer failed ($LASTEXITCODE)" }
-
-          $msvc = 'C:\BuildTools\VC\Tools\MSVC\14.44.35207'
-          if (-not (Test-Path $msvc)) {
-            $have = (Get-ChildItem 'C:\BuildTools\VC\Tools\MSVC' -Directory).Name -join ', '
-            throw "VS 17.14.0 did not install MSVC 14.44.35207; have: $have"
+          # 1. Locate MSVC in pre-installed Visual Studio 2022 Enterprise on windows-2022
+          $vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+          if (-not (Test-Path $vsRoot)) {
+            $vsRoot = (Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' -Directory | Select-Object -First 1).FullName
           }
+          $msvcBase = Join-Path $vsRoot 'VC\Tools\MSVC'
+          Write-Host "Searching in $msvcBase..."
+          $available = Get-ChildItem $msvcBase -Directory
+          Write-Host "Available MSVC toolsets: $($available.Name -join ', ')"
 
+          $targetVersion = '14.44.35207'
+          $exactMsvc = Join-Path $msvcBase $targetVersion
+          if (Test-Path $exactMsvc) {
+            $msvc = $exactMsvc
+          } else {
+            $candidate = ($available | Where-Object { $_.Name -like '14.44.*' } | Sort-Object Name -Descending | Select-Object -First 1)
+            if (-not $candidate) {
+              $candidate = ($available | Sort-Object Name -Descending | Select-Object -First 1)
+            }
+            Write-Host "Mapping $($candidate.FullName) to target $targetVersion"
+            New-Item -ItemType Directory -Force 'C:\Tools\MSVC' | Out-Null
+            $msvc = Join-Path 'C:\Tools\MSVC' $targetVersion
+            cmd /c mklink /J $msvc $candidate.FullName
+          }
+          Write-Host "Resolved MSVC_DIR: $msvc"
+
+          # 2. Locate Windows SDK 10.0.26100.0
           $sdk = 'C:\Program Files (x86)\Windows Kits\10'
           if (-not (Test-Path (Join-Path $sdk 'Include\10.0.26100.0'))) {
             throw "Windows SDK 10.0.26100.0 not found under $sdk"
           }
 
-          $ninja = (Get-ChildItem 'C:\BuildTools' -Recurse -Filter ninja.exe | Select-Object -First 1).FullName
-          if (-not $ninja) { $ninja = (Get-Command ninja).Source }
+          # 3. Locate Ninja
+          $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          if (-not $ninja) {
+            $ninja = (Get-ChildItem $vsRoot -Recurse -Filter ninja.exe | Select-Object -First 1).FullName
+          }
+          Write-Host "Resolved Ninja: $ninja"
 
           "MSVC_DIR=$msvc"   >> $env:GITHUB_ENV
           "SDK_DIR=$sdk"     >> $env:GITHUB_ENV
