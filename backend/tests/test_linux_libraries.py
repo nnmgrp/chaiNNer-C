@@ -4,10 +4,14 @@ reading of it (the launcher's is tested in tests/main/linuxLauncher.test.ts)."""
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+if sys.platform != "linux":
+    pytest.skip("Linux library resolution rules", allow_module_level=True)
 
 import linux_libraries
 import system

@@ -74,5 +74,6 @@ jobs:
               run: |
                   curl.exe -sL "https://github.com/nnmgrp/chaiNNer-C/releases/download/v0.3.9/chaiNNer-C-v0.3.9-win-x64.zip" -o "$env:RUNNER_TEMP\portable.zip"
                   & "C:\Program Files\7-Zip\7z.exe" e "$env:RUNNER_TEMP\portable.zip" -o"backend/src/nodes/impl" chainner_native.dll _chainner_graph.pyd -r -y
+                  & "C:\Program Files\7-Zip\7z.exe" e "$env:RUNNER_TEMP\portable.zip" -o"backend/src/chainner_ext" chainner_ext.pyd -r -y
             - name: pytest backend/tests
               run: ./native/runtime/cpython-3.14.8/Scripts/python -m pytest backend/tests
