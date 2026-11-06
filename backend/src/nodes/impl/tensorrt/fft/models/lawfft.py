@@ -324,6 +324,8 @@ class SFSAS(nn.Module):
         super().__init__()
         local = int(split * dim)
         global_dim = dim - local
+        self.local_dim = local
+        self.global_dim = global_dim
         self.local = nn.Sequential(DynamicLocal(local), DynamicLocal(local, 5))
         self.att = FSAS(
             global_dim, t_mid_factor, window_size, windowed, normalized=normalized
@@ -331,7 +333,7 @@ class SFSAS(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         local, glob = torch.split(
-            x, [self.local[0].conv.in_channels, self.att.to_hidden.in_channels], dim=1
+            x, [self.local_dim, self.global_dim], dim=1
         )
         return torch.cat([self.local(local), self.att(glob)], dim=1)
 

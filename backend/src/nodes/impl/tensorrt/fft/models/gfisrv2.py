@@ -290,12 +290,12 @@ class InceptionDWConv2d(nn.Module):
         self.dwconv_w = self.convs[(shift + 2) % 4]
         self.dwconv_h = self.convs[(shift + 3) % 4]
         indexs = [in_channels - 3 * gc, gc, gc, gc]
-        self.split_indexes = (
+        self.split_indexes: list[int] = [
             indexs[shift % 4],
             indexs[(shift + 1) % 4],
             indexs[(shift + 2) % 4],
             indexs[(shift + 3) % 4],
-        )
+        ]
 
     def forward(self, x: Tensor) -> Tensor:
         x_id, x_hw, x_w, x_h = torch.split(x, self.split_indexes, dim=1)
@@ -531,7 +531,7 @@ def detect_gfisrv2_params(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]
         for key, tensor in state_dict.items():
             if "upscale.0.weight" in key:
                 out_ch, in_ch = tensor.shape[:2]
-                out_nc = params.get("out_nc", 3)
+                out_nc = int(params.get("out_nc", 3))
                 if out_ch % out_nc == 0:
                     scale_sq = out_ch // out_nc
                     detected_scale = math.isqrt(scale_sq)
@@ -541,10 +541,11 @@ def detect_gfisrv2_params(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]
     # expansion_ratio
     for key, tensor in state_dict.items():
         if "fc1.weight" in key and "gfisr_body" in key:
-            out_ch = tensor.shape[0]
+            out_ch = int(tensor.shape[0])
             hidden = out_ch // 2
-            if hidden > 0 and params["dim"] > 0:
-                params["expansion_ratio"] = hidden / params["dim"]
+            dim = int(params.get("dim", 0))
+            if hidden > 0 and dim > 0:
+                params["expansion_ratio"] = hidden / dim
             break
 
     return params

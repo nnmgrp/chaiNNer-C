@@ -77,8 +77,8 @@ class Context:
         self.cleanups.append(fn)
 
 
-def writer(encoder: VideoEncoder = VideoEncoder.H265_NVENC, **changes) -> Writer:
-    fields = {
+def writer(encoder: VideoEncoder = VideoEncoder.H265_NVENC, **changes: Any) -> Writer:
+    fields: dict[str, Any] = {
         "container": VideoFormat.MKV,
         "encoder": encoder,
         "fps": 30,

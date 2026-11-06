@@ -122,7 +122,13 @@ def written_out_group_norm(
         target = None
         if reshape is not None and reshape.op_type == "Reshape":
             target = constant(reshape.input[1])
-        if target is None or len(target) != 3 or target[0] != 0 or target[2] != -1:
+        if (
+            target is None
+            or len(target) != 3
+            or target[0] != 0
+            or target[2] != -1
+            or reshape is None
+        ):
             nodes.append(node)
             continue
         groups = int(target[1])

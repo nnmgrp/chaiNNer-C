@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import base64
 import ctypes
-import ctypes
 import hashlib
 import io
 import json
@@ -1320,6 +1319,8 @@ def read_outcome(path: Path) -> tuple:
         image = load_image._read_cv(path)
     except Exception as error:
         return (type(error).__qualname__,)
+    if image is None:
+        return ("None",)
     return image.shape, sha(image)
 
 

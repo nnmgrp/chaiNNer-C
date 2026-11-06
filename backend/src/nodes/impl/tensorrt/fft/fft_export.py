@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.onnx import register_custom_op_symbolic
+from torch.onnx import register_custom_op_symbolic  # type: ignore[attr-defined]
 
 from .models.gfisrv2 import GFISRV2, detect_gfisrv2_params
 from .models.lawfft import LAWFFT, detect_lawfft_params
@@ -82,7 +82,7 @@ def load_fft_model(
         from spandrel import ModelLoader
 
         descriptor = ModelLoader().load_from_file(str(model_path))
-        if hasattr(descriptor, "model") and isinstance(descriptor.model, nn.Module):
+        if hasattr(descriptor, "model"):
             model = descriptor.model.eval()
             scale = getattr(descriptor, "scale", 1)
             arch_name = getattr(
@@ -174,7 +174,7 @@ def export_fft_onnx(
     if dynamic_axes is not None:
         kwargs["dynamic_axes"] = dynamic_axes
 
-    torch.onnx.export(model, dummy, str(output_path), **kwargs)
+    torch.onnx.export(model, (dummy,), str(output_path), **kwargs)
 
     return {
         "scale": scale,

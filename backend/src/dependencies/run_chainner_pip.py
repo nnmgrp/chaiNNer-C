@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 """Runs chainner_pip as `python -m chainner_pip` does, with upstream pip's fix for a
 wheel it downloads twice (pip issue 11847), which the bundled chainner_pip 23.2 lacks.
 
