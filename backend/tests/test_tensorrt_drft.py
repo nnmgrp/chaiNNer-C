@@ -12,8 +12,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-import cuda.bindings
 import pytest
+
+pytest.importorskip("cuda.bindings")
+import cuda.bindings
 from onnx import TensorProto, helper
 
 from api import NodeContext
